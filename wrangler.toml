@@ -1,3 +1,6 @@
 name = "vidcom-2-life-v3"
 compatibility_date = "2026-01-28"
 compatibility_flags = ["nodejs_compat"]
+
+# Tell Pages what directory your build outputs to
+pages_build_output_dir = "dist"
