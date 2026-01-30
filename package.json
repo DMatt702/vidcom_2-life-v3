@@ -1,25 +1,14 @@
 {
-  "name": "vidcom_2-life-v3",
+  "name": "vidcom-2life-v4",
   "private": true,
-  "version": "0.1.0",
-  "type": "module",
+  "version": "0.0.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "qrcode": "^1.5.4",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.2"
-  },
-  "devDependencies": {
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
-    "@types/qrcode": "^1.5.5",
-    "typescript": "^5.5.4",
-    "vite": "^5.4.2",
-    "@vitejs/plugin-react": "^4.3.1"
+    "dev": "powershell -ExecutionPolicy Bypass -File ./scripts/dev.ps1",
+    "check": "powershell -ExecutionPolicy Bypass -File ./scripts/check.ps1",
+    "deploy": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy.ps1"
   }
 }
