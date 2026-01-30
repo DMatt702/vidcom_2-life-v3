@@ -22,6 +22,7 @@ Write-Host "Structure check passed."
 Write-Host "Running builds..."
 
 npm --workspace packages/shared run build
+npm --workspace packages/matcher run build
 npm --workspace apps/api run build
 npm --workspace apps/admin run build
 
