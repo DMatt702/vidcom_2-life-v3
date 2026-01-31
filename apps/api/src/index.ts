@@ -389,10 +389,18 @@ export default {
         const isActiveValue = body.is_active;
         const isActive =
           typeof isActiveValue === "boolean" ? (isActiveValue ? 1 : 0) : null;
-        if (!name && isActive === null) return errorResponse("No updates provided");
+        const hasQrId = Object.prototype.hasOwnProperty.call(body, "qr_id");
+        const qrId = hasQrId ? assertString(body.qr_id, "qr_id") : null;
+        if (hasQrId && !qrId) return errorResponse("Missing qr_id");
+        if (!name && isActive === null && !hasQrId) return errorResponse("No updates provided");
         if (name) {
           await env.DB.prepare("UPDATE experiences SET name = ? WHERE id = ?")
             .bind(name, id)
+            .run();
+        }
+        if (hasQrId && qrId) {
+          await env.DB.prepare("UPDATE experiences SET qr_id = ? WHERE id = ?")
+            .bind(qrId, id)
             .run();
         }
         if (isActive !== null) {
@@ -566,18 +574,26 @@ export default {
     if (request.method === "GET" && path.startsWith("/public/experience/")) {
       const qrId = path.split("/")[3];
       if (!qrId) return errorResponse("Missing qr id");
-      const experience = await env.DB.prepare(
-        "SELECT id, name, qr_id, is_active FROM experiences WHERE qr_id = ?"
+      const experienceResults = await env.DB.prepare(
+        "SELECT id, name, qr_id, is_active FROM experiences WHERE qr_id = ? ORDER BY rowid DESC"
       )
         .bind(qrId)
-        .first<{ id: string; name: string; qr_id: string; is_active: number }>();
-      if (!experience || !experience.is_active) return errorResponse("Not found", 404);
+        .all<{ id: string; name: string; qr_id: string; is_active: number }>();
+      const experiences = experienceResults.results.map((exp) => ({
+        ...exp,
+        is_active: Boolean(exp.is_active)
+      }));
+      if (!experiences.length) return errorResponse("Not found", 404);
+      const activeExperiences = experiences.filter((exp) => exp.is_active);
+      if (!activeExperiences.length) return errorResponse("Not found", 404);
+      const placeholders = activeExperiences.map(() => "?").join(",");
       const pairs = await env.DB.prepare(
-        "SELECT pairs.id, pairs.image_asset_id, pairs.video_asset_id, pairs.image_fingerprint, pairs.threshold, pairs.priority, assets.r2_key as video_r2_key, assets.mime as video_mime FROM pairs JOIN assets ON assets.id = pairs.video_asset_id WHERE pairs.experience_id = ? AND pairs.is_active = 1"
+        `SELECT pairs.id, pairs.experience_id, pairs.image_asset_id, pairs.video_asset_id, pairs.image_fingerprint, pairs.threshold, pairs.priority, assets.r2_key as video_r2_key, assets.mime as video_mime FROM pairs JOIN assets ON assets.id = pairs.video_asset_id WHERE pairs.experience_id IN (${placeholders}) AND pairs.is_active = 1`
       )
-        .bind(experience.id)
+        .bind(...activeExperiences.map((exp) => exp.id))
         .all<{
           id: string;
+          experience_id: string;
           image_asset_id: string;
           video_asset_id: string;
           image_fingerprint: string;
@@ -592,6 +608,7 @@ export default {
           const videoUrl = await buildSignedAssetUrl(url.origin, pair.video_r2_key, secret, "/public/video/");
           return {
             id: pair.id,
+            experience_id: pair.experience_id,
             image_asset_id: pair.image_asset_id,
             video_asset_id: pair.video_asset_id,
             image_fingerprint: JSON.parse(pair.image_fingerprint),
@@ -602,12 +619,18 @@ export default {
           };
         })
       );
+      const primaryExperience = activeExperiences[0];
       return jsonResponse({
         experience: {
-          id: experience.id,
-          name: experience.name,
-          qr_id: experience.qr_id
+          id: primaryExperience.id,
+          name: primaryExperience.name,
+          qr_id: primaryExperience.qr_id
         },
+        experiences: experiences.map((exp) => ({
+          id: exp.id,
+          name: exp.name,
+          is_active: exp.is_active
+        })),
         pairs: signedPairs
       });
     }

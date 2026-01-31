@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import QRCode from "qrcode";
 import { generateImageFingerprint, type ImageFingerprint } from "@vidcom/shared";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
@@ -51,6 +52,12 @@ function filenameFromR2Key(r2Key?: string) {
     : lastSegment;
 }
 
+function sanitizeFilename(name: string) {
+  const trimmed = name.trim();
+  const safe = trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return safe || "experience";
+}
+
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem("vidcom_admin_token") ?? "");
   const [authChecked, setAuthChecked] = useState(false);
@@ -78,6 +85,8 @@ export default function App() {
   const [priority, setPriority] = useState("0");
   const [isUploading, setIsUploading] = useState(false);
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
+  const [assignQrId, setAssignQrId] = useState("");
+  const [isAssigningQrId, setIsAssigningQrId] = useState(false);
 
   const [publicPreview, setPublicPreview] = useState<string>("");
   const [isVerifyingPublic, setIsVerifyingPublic] = useState(false);
@@ -87,6 +96,10 @@ export default function App() {
     () => experiences.find((exp) => exp.id === selectedExperienceId) ?? experienceDetail,
     [experiences, experienceDetail, selectedExperienceId]
   );
+  const sharesQrId = useMemo(() => {
+    if (!selectedExperience) return false;
+    return experiences.filter((exp) => exp.qr_id === selectedExperience.qr_id).length > 1;
+  }, [experiences, selectedExperience]);
 
   function pushToast(tone: Toast["tone"], message: string) {
     const toast = buildToast(tone, message);
@@ -345,13 +358,48 @@ export default function App() {
     }
   }
 
-  async function handleCopyQr() {
+  async function handleDownloadQr() {
     if (!selectedExperience?.qr_id) return;
     try {
-      await navigator.clipboard.writeText(selectedExperience.qr_id);
-      pushToast("success", "QR_ID copied.");
+      const dataUrl = await QRCode.toDataURL(selectedExperience.qr_id, {
+        width: 1024,
+        margin: 2,
+        errorCorrectionLevel: "H"
+      });
+      const fileName = `${sanitizeFilename(selectedExperience.name)}-qr-${selectedExperience.qr_id}.png`;
+      const link = document.createElement("a");
+      link.href = dataUrl;
+      link.download = fileName;
+      link.click();
+      link.remove();
+      pushToast("success", "QR PNG downloaded.");
     } catch {
-      pushToast("error", "Clipboard copy failed.");
+      pushToast("error", "QR download failed.");
+    }
+  }
+
+  async function handleAssignQrId() {
+    if (!selectedExperience) return;
+    const nextQrId = assignQrId.trim();
+    if (!nextQrId) {
+      pushToast("error", "QR_ID is required.");
+      return;
+    }
+    setIsAssigningQrId(true);
+    try {
+      const updated = await apiRequest<Experience>(`/experiences/${selectedExperience.id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ qr_id: nextQrId })
+      });
+      setExperiences((prev) => prev.map((exp) => (exp.id === updated.id ? updated : exp)));
+      setExperienceDetail(updated);
+      setAssignQrId("");
+      pushToast("success", "QR_ID assigned.");
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to assign QR_ID.");
+    } finally {
+      setIsAssigningQrId(false);
     }
   }
 
@@ -560,19 +608,44 @@ export default function App() {
                   <div className="muted">
                     QR_ID: <span className="mono">{selectedExperience.qr_id}</span>
                   </div>
+                  {sharesQrId && (
+                    <div className="note">This experience shares QR_ID with other experiences.</div>
+                  )}
                 </div>
                 <div className="experience-actions">
                   <span className={`badge ${selectedExperience.is_active ? "active" : "inactive"}`}>
                     {selectedExperience.is_active ? "Active" : "Inactive"}
                   </span>
-                  <button type="button" onClick={handleCopyQr}>
-                    Copy QR_ID
+                  <button type="button" onClick={handleDownloadQr}>
+                    Download QR (PNG)
                   </button>
                   <button type="button" className="secondary" onClick={handleToggleExperience}>
                     {selectedExperience.is_active ? "Deactivate" : "Activate"}
                   </button>
                   <button type="button" className="danger" onClick={handleDeleteExperience}>
                     Delete Experience
+                  </button>
+                </div>
+              </div>
+
+              <div className="section">
+                <h3>Assign existing QR_ID</h3>
+                <div className="row">
+                  <label className="field">
+                    QR_ID
+                    <input
+                      type="text"
+                      value={assignQrId}
+                      onChange={(event) => setAssignQrId(event.target.value)}
+                      placeholder="Paste QR_ID to share"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleAssignQrId}
+                    disabled={!assignQrId.trim() || isAssigningQrId}
+                  >
+                    {isAssigningQrId ? "Assigning..." : "Assign"}
                   </button>
                 </div>
               </div>
@@ -824,6 +897,12 @@ function AppStyles() {
       .muted {
         color: #5c6476;
         font-size: 0.9rem;
+      }
+      .note {
+        margin-top: 6px;
+        font-size: 0.8rem;
+        color: #1d4ed8;
+        font-weight: 600;
       }
       .mono {
         font-family: "Consolas", "Courier New", monospace;
