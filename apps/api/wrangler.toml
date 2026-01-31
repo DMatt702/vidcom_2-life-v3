@@ -1,4 +1,4 @@
-name = "vidcom-api"
+﻿name = "vidcom-api"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
@@ -11,7 +11,10 @@ SIGNING_SECRET = "dev-signing-secret"
 binding = "DB"
 database_name = "vidcom_dev"
 database_id = "00000000-0000-0000-0000-000000000000"
+preview_database_id = "00000000-0000-0000-0000-000000000000"
 
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "vidcom-dev"
+preview_bucket_name = "vidcom-dev"
+
