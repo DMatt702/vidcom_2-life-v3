@@ -10,11 +10,18 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 
 const encoder = new TextEncoder();
 
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "authorization, content-type",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS"
+};
+
 function jsonResponse(data: JsonValue, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
+      ...corsHeaders,
       ...headers
     }
   });
@@ -156,8 +163,12 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
     if (path === "/health") {
-      return new Response("ok", { status: 200 });
+      return new Response("ok", { status: 200, headers: corsHeaders });
     }
 
     if (request.method === "POST" && path === "/dev/seed-admin") {
@@ -391,45 +402,75 @@ export default {
       }
     }
 
-    if (path.endsWith("/pairs") && request.method === "POST") {
+    if (path.endsWith("/pairs")) {
       const user = await requireAuth(request, env);
       if (!user) return errorResponse("Unauthorized", 401);
       const experienceId = path.split("/")[2];
       if (!experienceId) return errorResponse("Missing experience id");
-      const body = await parseJsonBody(request);
-      if (!body) return errorResponse("Expected JSON body");
-      const imageAssetId = assertString(body.image_asset_id, "image_asset_id");
-      const videoAssetId = assertString(body.video_asset_id, "video_asset_id");
-      const fingerprint = body.image_fingerprint;
-      if (!imageAssetId || !videoAssetId || typeof fingerprint !== "object") {
-        return errorResponse("Missing or invalid pair fields");
-      }
-      const threshold = assertNumber(body.match_threshold, "match_threshold") ?? 0.8;
-      const priority = assertNumber(body.priority, "priority") ?? 0;
-      const pairId = crypto.randomUUID();
-      await env.DB.prepare(
-        "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
-      )
-        .bind(
-          pairId,
-          experienceId,
-          imageAssetId,
-          videoAssetId,
-          JSON.stringify(fingerprint),
-          threshold,
-          priority
+      if (request.method === "GET") {
+        const results = await env.DB.prepare(
+          "SELECT pairs.id, pairs.image_asset_id, pairs.video_asset_id, pairs.image_fingerprint, pairs.threshold, pairs.priority, pairs.is_active, img.r2_key as image_r2_key, img.mime as image_mime, img.size as image_size, vid.r2_key as video_r2_key, vid.mime as video_mime, vid.size as video_size FROM pairs JOIN assets img ON img.id = pairs.image_asset_id JOIN assets vid ON vid.id = pairs.video_asset_id WHERE pairs.experience_id = ? ORDER BY pairs.rowid DESC"
         )
-        .run();
-      return jsonResponse({
-        id: pairId,
-        experience_id: experienceId,
-        image_asset_id: imageAssetId,
-        video_asset_id: videoAssetId,
-        image_fingerprint: fingerprint,
-        threshold,
-        priority,
-        is_active: true
-      });
+          .bind(experienceId)
+          .all<{
+            id: string;
+            image_asset_id: string;
+            video_asset_id: string;
+            image_fingerprint: string;
+            threshold: number;
+            priority: number;
+            is_active: number;
+            image_r2_key: string;
+            image_mime: string;
+            image_size: number;
+            video_r2_key: string;
+            video_mime: string;
+            video_size: number;
+          }>();
+        return jsonResponse({
+          pairs: results.results.map((pair) => ({
+            ...pair,
+            image_fingerprint: JSON.parse(pair.image_fingerprint),
+            is_active: Boolean(pair.is_active)
+          }))
+        });
+      }
+      if (request.method === "POST") {
+        const body = await parseJsonBody(request);
+        if (!body) return errorResponse("Expected JSON body");
+        const imageAssetId = assertString(body.image_asset_id, "image_asset_id");
+        const videoAssetId = assertString(body.video_asset_id, "video_asset_id");
+        const fingerprint = body.image_fingerprint;
+        if (!imageAssetId || !videoAssetId || typeof fingerprint !== "object") {
+          return errorResponse("Missing or invalid pair fields");
+        }
+        const threshold = assertNumber(body.match_threshold, "match_threshold") ?? 0.8;
+        const priority = assertNumber(body.priority, "priority") ?? 0;
+        const pairId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
+        )
+          .bind(
+            pairId,
+            experienceId,
+            imageAssetId,
+            videoAssetId,
+            JSON.stringify(fingerprint),
+            threshold,
+            priority
+          )
+          .run();
+        return jsonResponse({
+          id: pairId,
+          experience_id: experienceId,
+          image_asset_id: imageAssetId,
+          video_asset_id: videoAssetId,
+          image_fingerprint: fingerprint,
+          threshold,
+          priority,
+          is_active: true
+        });
+      }
     }
 
     if (path.startsWith("/pairs/")) {
@@ -560,7 +601,10 @@ export default {
       if (obj.httpMetadata?.contentType) {
         headers.set("content-type", obj.httpMetadata.contentType);
       }
-      return new Response(obj.body, { status: 200, headers });
+      return new Response(obj.body, {
+        status: 200,
+        headers: { ...corsHeaders, ...Object.fromEntries(headers) }
+      });
     }
 
     return errorResponse("Not found", 404);
