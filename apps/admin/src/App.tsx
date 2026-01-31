@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { generateImageFingerprint, type ImageFingerprint } from "@vidcom/shared";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
@@ -20,6 +20,8 @@ type Pair = {
   is_active: boolean;
   image_r2_key?: string;
   video_r2_key?: string;
+  image_url?: string;
+  video_url?: string;
   image_mime?: string;
   video_mime?: string;
   image_size?: number;
@@ -35,6 +37,18 @@ type Toast = {
 function buildToast(tone: Toast["tone"], message: string): Toast {
   const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   return { id, tone, message };
+}
+
+function filenameFromR2Key(r2Key?: string) {
+  if (!r2Key) return "Unknown file";
+  const lastSegment = r2Key.split("/").pop() ?? r2Key;
+  if (lastSegment.length > 37 && lastSegment[36] === "-") {
+    return lastSegment.slice(37);
+  }
+  const dashIndex = lastSegment.indexOf("-");
+  return dashIndex >= 0 && dashIndex + 1 < lastSegment.length
+    ? lastSegment.slice(dashIndex + 1)
+    : lastSegment;
 }
 
 export default function App() {
@@ -56,9 +70,14 @@ export default function App() {
 
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const videoInputRef = useRef<HTMLInputElement | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [videoError, setVideoError] = useState<string | null>(null);
   const [matchThreshold, setMatchThreshold] = useState("0.8");
   const [priority, setPriority] = useState("0");
   const [isUploading, setIsUploading] = useState(false);
+  const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
 
   const [publicPreview, setPublicPreview] = useState<string>("");
   const [isVerifyingPublic, setIsVerifyingPublic] = useState(false);
@@ -129,10 +148,12 @@ export default function App() {
     if (!selectedExperienceId) {
       setExperienceDetail(null);
       setPairs([]);
+      setMoveTargets({});
       return;
     }
     loadExperienceDetail(selectedExperienceId);
     loadPairs(selectedExperienceId);
+    setMoveTargets({});
   }, [selectedExperienceId]);
 
   async function handleLogin(event: React.FormEvent) {
@@ -276,10 +297,19 @@ export default function App() {
       pushToast("error", "Select an experience first.");
       return;
     }
-    if (!imageFile || !videoFile) {
-      pushToast("error", "Image and video files are required.");
+    const selectedImage = imageFile ?? imageInputRef.current?.files?.[0] ?? null;
+    const selectedVideo = videoFile ?? videoInputRef.current?.files?.[0] ?? null;
+    if (!selectedImage) {
+      setImageError("Image is required.");
+    }
+    if (!selectedVideo) {
+      setVideoError("Video is required.");
+    }
+    if (!selectedImage || !selectedVideo) {
       return;
     }
+    setImageError(null);
+    setVideoError(null);
     const thresholdValue = Number.parseFloat(matchThreshold);
     const priorityValue = Number.parseInt(priority, 10);
     if (Number.isNaN(thresholdValue) || Number.isNaN(priorityValue)) {
@@ -288,9 +318,9 @@ export default function App() {
     }
     setIsUploading(true);
     try {
-      const imageAsset = await uploadAsset(imageFile, "image");
-      const fingerprint = await generateImageFingerprint(imageFile);
-      const videoAsset = await uploadAsset(videoFile, "video");
+      const imageAsset = await uploadAsset(selectedImage, "image");
+      const fingerprint = await generateImageFingerprint(selectedImage);
+      const videoAsset = await uploadAsset(selectedVideo, "video");
       await apiRequest(`/experiences/${selectedExperienceId}/pairs`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -305,6 +335,8 @@ export default function App() {
       pushToast("success", "Pair created.");
       setImageFile(null);
       setVideoFile(null);
+      if (imageInputRef.current) imageInputRef.current.value = "";
+      if (videoInputRef.current) videoInputRef.current.value = "";
       await loadPairs(selectedExperienceId);
     } catch (error) {
       pushToast("error", error instanceof Error ? error.message : "Failed to create pair.");
@@ -320,6 +352,84 @@ export default function App() {
       pushToast("success", "QR_ID copied.");
     } catch {
       pushToast("error", "Clipboard copy failed.");
+    }
+  }
+
+  async function handleToggleExperience() {
+    if (!selectedExperience) return;
+    const nextValue = !selectedExperience.is_active;
+    try {
+      const updated = await apiRequest<Experience>(`/experiences/${selectedExperience.id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ is_active: nextValue })
+      });
+      setExperiences((prev) =>
+        prev.map((exp) => (exp.id === updated.id ? updated : exp))
+      );
+      setExperienceDetail(updated);
+      pushToast("success", `Experience ${nextValue ? "activated" : "deactivated"}.`);
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to update experience.");
+    }
+  }
+
+  async function handleDeleteExperience() {
+    if (!selectedExperience) return;
+    const confirmed = window.confirm(
+      `Delete experience "${selectedExperience.name}" and all its pairs? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      await apiRequest(`/experiences/${selectedExperience.id}`, { method: "DELETE" });
+      pushToast("success", "Experience deleted.");
+      setExperiences((prev) => prev.filter((exp) => exp.id !== selectedExperience.id));
+      setPairs([]);
+      setExperienceDetail(null);
+      setSelectedExperienceId((prevSelected) => {
+        if (prevSelected !== selectedExperience.id) return prevSelected;
+        const remaining = experiences.filter((exp) => exp.id !== selectedExperience.id);
+        return remaining[0]?.id ?? null;
+      });
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to delete experience.");
+    }
+  }
+
+  async function handleDeletePair(pairId: string) {
+    const confirmed = window.confirm("Delete this pair? This cannot be undone.");
+    if (!confirmed) return;
+    try {
+      await apiRequest(`/pairs/${pairId}`, { method: "DELETE" });
+      pushToast("success", "Pair deleted.");
+      if (selectedExperienceId) {
+        await loadPairs(selectedExperienceId);
+      }
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to delete pair.");
+    }
+  }
+
+  async function handleMovePair(pairId: string) {
+    const targetId = moveTargets[pairId];
+    if (!targetId || targetId === selectedExperienceId) return;
+    try {
+      await apiRequest(`/pairs/${pairId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ experience_id: targetId })
+      });
+      pushToast("success", "Pair moved.");
+      setMoveTargets((prev) => {
+        const next = { ...prev };
+        delete next[pairId];
+        return next;
+      });
+      if (selectedExperienceId) {
+        await loadPairs(selectedExperienceId);
+      }
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to move pair.");
     }
   }
 
@@ -443,19 +553,26 @@ export default function App() {
           {!selectedExperience && <div className="muted">Select an experience to view details.</div>}
           {selectedExperience && (
             <div className="stack">
-              <div className="detail-row">
+              <div className="experience-header">
                 <div>
-                  <div className="label">Name</div>
-                  <div>{selectedExperience.name}</div>
+                  <div className="label">Current Experience</div>
+                  <h3>{selectedExperience.name}</h3>
+                  <div className="muted">
+                    QR_ID: <span className="mono">{selectedExperience.qr_id}</span>
+                  </div>
                 </div>
-                <div>
-                  <div className="label">QR_ID</div>
-                  <div className="mono">{selectedExperience.qr_id}</div>
-                </div>
-                <div>
-                  <div className="label">Actions</div>
+                <div className="experience-actions">
+                  <span className={`badge ${selectedExperience.is_active ? "active" : "inactive"}`}>
+                    {selectedExperience.is_active ? "Active" : "Inactive"}
+                  </span>
                   <button type="button" onClick={handleCopyQr}>
                     Copy QR_ID
+                  </button>
+                  <button type="button" className="secondary" onClick={handleToggleExperience}>
+                    {selectedExperience.is_active ? "Deactivate" : "Activate"}
+                  </button>
+                  <button type="button" className="danger" onClick={handleDeleteExperience}>
+                    Delete Experience
                   </button>
                 </div>
               </div>
@@ -477,22 +594,90 @@ export default function App() {
                     <thead>
                       <tr>
                         <th>ID</th>
-                        <th>Image Asset</th>
-                        <th>Video Asset</th>
+                        <th>Image</th>
+                        <th>Video</th>
                         <th>Threshold</th>
                         <th>Priority</th>
                         <th>Active</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
                       {pairs.map((pair) => (
                         <tr key={pair.id}>
                           <td className="mono">{pair.id}</td>
-                          <td className="mono">{pair.image_asset_id}</td>
-                          <td className="mono">{pair.video_asset_id}</td>
+                          <td>
+                            <div className="pair-media">
+                              {pair.image_url ? (
+                                <img
+                                  className="thumb"
+                                  src={pair.image_url}
+                                  alt={`Pair ${pair.id} thumbnail`}
+                                  loading="lazy"
+                                />
+                              ) : (
+                                <div className="thumb placeholder">No image</div>
+                              )}
+                              <div className="file-meta mono">{pair.image_asset_id}</div>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="pair-media">
+                              <div className="file-meta">
+                                <span className="file-icon" aria-hidden="true">🎬</span>
+                                <span>{filenameFromR2Key(pair.video_r2_key)}</span>
+                              </div>
+                              <div className="mono">{pair.video_asset_id}</div>
+                              {pair.video_url ? (
+                                <a className="link" href={pair.video_url} target="_blank" rel="noreferrer">
+                                  View
+                                </a>
+                              ) : (
+                                <span className="muted">No signed URL</span>
+                              )}
+                            </div>
+                          </td>
                           <td>{pair.threshold.toFixed(2)}</td>
                           <td>{pair.priority}</td>
                           <td>{pair.is_active ? "Yes" : "No"}</td>
+                          <td>
+                            <div className="pair-actions">
+                              <select
+                                value={moveTargets[pair.id] ?? ""}
+                                onChange={(event) =>
+                                  setMoveTargets((prev) => ({
+                                    ...prev,
+                                    [pair.id]: event.target.value
+                                  }))
+                                }
+                              >
+                                <option value="">Move to...</option>
+                                {experiences.map((exp) => (
+                                  <option key={exp.id} value={exp.id}>
+                                    {exp.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="secondary"
+                                disabled={
+                                  !moveTargets[pair.id] ||
+                                  moveTargets[pair.id] === selectedExperienceId
+                                }
+                                onClick={() => handleMovePair(pair.id)}
+                              >
+                                Move
+                              </button>
+                              <button
+                                type="button"
+                                className="danger"
+                                onClick={() => handleDeletePair(pair.id)}
+                              >
+                                Delete pair
+                              </button>
+                            </div>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -508,16 +693,26 @@ export default function App() {
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(event) => setImageFile(event.target.files?.[0] ?? null)}
+                      ref={imageInputRef}
+                      onChange={(event) => {
+                        setImageFile(event.target.files?.[0] ?? null);
+                        setImageError(null);
+                      }}
                     />
+                    {imageError && <span className="inline-error">{imageError}</span>}
                   </label>
                   <label className="field">
                     Video file
                     <input
                       type="file"
                       accept="video/*"
-                      onChange={(event) => setVideoFile(event.target.files?.[0] ?? null)}
+                      ref={videoInputRef}
+                      onChange={(event) => {
+                        setVideoFile(event.target.files?.[0] ?? null);
+                        setVideoError(null);
+                      }}
                     />
+                    {videoError && <span className="inline-error">{videoError}</span>}
                   </label>
                   <div className="row">
                     <label className="field">
@@ -701,6 +896,37 @@ function AppStyles() {
         padding: 12px;
         border-radius: 12px;
       }
+      .experience-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        background: #f8f9fd;
+        padding: 16px;
+        border-radius: 12px;
+      }
+      .experience-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-end;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .badge.active {
+        background: #dcfce7;
+        color: #166534;
+      }
+      .badge.inactive {
+        background: #fee2e2;
+        color: #991b1b;
+      }
       .label {
         font-size: 0.75rem;
         text-transform: uppercase;
@@ -716,9 +942,23 @@ function AppStyles() {
         font-weight: 600;
         cursor: pointer;
       }
+      button.secondary {
+        background: #e2e8f0;
+        color: #0f172a;
+      }
+      button.danger {
+        background: #dc2626;
+      }
       button:disabled {
         opacity: 0.6;
         cursor: not-allowed;
+      }
+      select {
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid #d4d8e2;
+        background: #fff;
+        font-size: 0.85rem;
       }
       .section {
         border-top: 1px solid #e5e8f0;
@@ -740,6 +980,50 @@ function AppStyles() {
         border-bottom: 1px solid #edf0f6;
         padding: 8px;
         text-align: left;
+        vertical-align: top;
+      }
+      .pair-media {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .thumb {
+        width: 80px;
+        height: 60px;
+        object-fit: cover;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+        background: #f1f5f9;
+      }
+      .thumb.placeholder {
+        display: grid;
+        place-items: center;
+        font-size: 0.7rem;
+        color: #64748b;
+      }
+      .file-meta {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.8rem;
+      }
+      .file-icon {
+        font-size: 1rem;
+      }
+      .pair-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-start;
+      }
+      .link {
+        color: #1d4ed8;
+        font-weight: 600;
+        text-decoration: none;
+      }
+      .inline-error {
+        color: #dc2626;
+        font-size: 0.8rem;
       }
       .preview {
         margin-top: 12px;
@@ -794,6 +1078,9 @@ function AppStyles() {
           align-items: flex-start;
         }
         .header-actions {
+          align-items: flex-start;
+        }
+        .experience-actions {
           align-items: flex-start;
         }
       }

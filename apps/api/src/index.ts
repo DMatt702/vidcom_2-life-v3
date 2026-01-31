@@ -111,6 +111,17 @@ async function verifyPayload(token: string, secret: string): Promise<Record<stri
   return JSON.parse(body) as Record<string, JsonValue>;
 }
 
+async function buildSignedAssetUrl(origin: string, r2Key: string, secret: string, pathPrefix: string) {
+  const token = await signPayload(
+    {
+      r2Key,
+      exp: Date.now() + 1000 * 60 * 5
+    },
+    secret
+  );
+  return `${origin}${pathPrefix}${encodeURIComponent(r2Key)}?token=${encodeURIComponent(token)}`;
+}
+
 async function requireAuth(request: Request, env: Env) {
   const token = parseAuthToken(request);
   if (!token) return null;
@@ -400,6 +411,17 @@ export default {
           is_active: Boolean(updated.is_active)
         });
       }
+      if (request.method === "DELETE") {
+        const existing = await env.DB.prepare("SELECT id FROM experiences WHERE id = ?")
+          .bind(id)
+          .first<{ id: string }>();
+        if (!existing) return errorResponse("Not found", 404);
+        await env.DB.prepare("DELETE FROM pairs WHERE experience_id = ?")
+          .bind(id)
+          .run();
+        await env.DB.prepare("DELETE FROM experiences WHERE id = ?").bind(id).run();
+        return jsonResponse({ ok: true });
+      }
     }
 
     if (path.endsWith("/pairs")) {
@@ -427,12 +449,17 @@ export default {
             video_mime: string;
             video_size: number;
           }>();
+        const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
         return jsonResponse({
-          pairs: results.results.map((pair) => ({
-            ...pair,
-            image_fingerprint: JSON.parse(pair.image_fingerprint),
-            is_active: Boolean(pair.is_active)
-          }))
+          pairs: await Promise.all(
+            results.results.map(async (pair) => ({
+              ...pair,
+              image_fingerprint: JSON.parse(pair.image_fingerprint),
+              is_active: Boolean(pair.is_active),
+              image_url: await buildSignedAssetUrl(url.origin, pair.image_r2_key, secret, "/public/asset/"),
+              video_url: await buildSignedAssetUrl(url.origin, pair.video_r2_key, secret, "/public/asset/")
+            }))
+          )
         });
       }
       if (request.method === "POST") {
@@ -486,6 +513,15 @@ export default {
         if (typeof body.is_active === "boolean") {
           updates.push("is_active = ?");
           binds.push(body.is_active ? 1 : 0);
+        }
+        if (typeof body.experience_id === "string" && body.experience_id.trim()) {
+          const nextExperienceId = body.experience_id.trim();
+          const existing = await env.DB.prepare("SELECT id FROM experiences WHERE id = ?")
+            .bind(nextExperienceId)
+            .first<{ id: string }>();
+          if (!existing) return errorResponse("Experience not found", 404);
+          updates.push("experience_id = ?");
+          binds.push(nextExperienceId);
         }
         if (typeof body.threshold === "number") {
           updates.push("threshold = ?");
@@ -553,16 +589,7 @@ export default {
       const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
       const signedPairs = await Promise.all(
         pairs.results.map(async (pair) => {
-          const token = await signPayload(
-            {
-              r2Key: pair.video_r2_key,
-              exp: Date.now() + 1000 * 60 * 5
-            },
-            secret
-          );
-          const videoUrl = `${url.origin}/public/video/${encodeURIComponent(
-            pair.video_r2_key
-          )}?token=${encodeURIComponent(token)}`;
+          const videoUrl = await buildSignedAssetUrl(url.origin, pair.video_r2_key, secret, "/public/video/");
           return {
             id: pair.id,
             image_asset_id: pair.image_asset_id,
@@ -585,7 +612,7 @@ export default {
       });
     }
 
-    if (request.method === "GET" && path.startsWith("/public/video/")) {
+    if (request.method === "GET" && (path.startsWith("/public/video/") || path.startsWith("/public/asset/"))) {
       const token = url.searchParams.get("token");
       if (!token) return errorResponse("Missing token", 401);
       const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
@@ -593,7 +620,8 @@ export default {
       if (!payload) return errorResponse("Invalid token", 401);
       const exp = typeof payload.exp === "number" ? payload.exp : 0;
       if (Date.now() > exp) return errorResponse("Token expired", 403);
-      const r2Key = decodeURIComponent(path.replace("/public/video/", ""));
+      const prefix = path.startsWith("/public/video/") ? "/public/video/" : "/public/asset/";
+      const r2Key = decodeURIComponent(path.replace(prefix, ""));
       if (payload.r2Key !== r2Key) return errorResponse("Token mismatch", 403);
       const obj = await env.BUCKET.get(r2Key);
       if (!obj) return errorResponse("Not found", 404);
