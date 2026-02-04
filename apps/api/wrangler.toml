@@ -18,3 +18,20 @@ binding = "BUCKET"
 bucket_name = "vidcom-dev"
 preview_bucket_name = "vidcom-dev"
 
+[env.staging]
+name = "vidcom-api-staging"
+
+[env.staging.vars]
+NODE_ENV = "staging"
+SESSION_SECRET = "staging-session-secret"
+SIGNING_SECRET = "staging-signing-secret"
+GITHUB_REF = "v4-clean-rebuild"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "vidcom_staging"
+database_id = "96160f3d-3ced-401c-b974-8e38ed2a0664"
+
+[[env.staging.r2_buckets]]
+binding = "BUCKET"
+bucket_name = "vidcom-staging"

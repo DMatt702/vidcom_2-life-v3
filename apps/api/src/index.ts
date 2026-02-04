@@ -1,663 +1,754 @@
-export interface Env {
+﻿export interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
   NODE_ENV?: string;
   SESSION_SECRET?: string;
   SIGNING_SECRET?: string;
+  MINDAR_JOB_SECRET?: string;
+  GITHUB_TOKEN?: string;
+  GITHUB_REPO?: string;
+  GITHUB_REF?: string;
 }
 
-type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+const BUILD = "STAGING-BUILD-2026-02-04-B";
 
-const encoder = new TextEncoder();
+type User = { email: string };
 
-const corsHeaders = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, content-type",
-  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS"
-};
-
-function jsonResponse(data: JsonValue, status = 200, headers: HeadersInit = {}): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      ...corsHeaders,
-      ...headers
-    }
-  });
+function base64urlEncode(bytes: ArrayBuffer) {
+  const bin = String.fromCharCode(...new Uint8Array(bytes));
+  const b64 = btoa(bin);
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
-
-function errorResponse(message: string, status = 400): Response {
-  return jsonResponse({ error: message }, status);
+function base64urlEncodeText(text: string) {
+  return base64urlEncode(new TextEncoder().encode(text).buffer);
 }
-
-function parseAuthToken(request: Request): string | null {
-  const authHeader = request.headers.get("authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7).trim();
-  }
-
-  const cookie = request.headers.get("cookie");
-  if (!cookie) return null;
-  const parts = cookie.split(";").map((part) => part.trim());
-  for (const part of parts) {
-    const [key, value] = part.split("=");
-    if (key === "session_token") return value;
-  }
-  return null;
+function base64urlDecodeToText(s: string) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
-
-function base64UrlEncode(input: ArrayBuffer): string {
-  const bytes = new Uint8Array(input);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function randomToken(bytes = 32): string {
-  const buffer = new Uint8Array(bytes);
-  crypto.getRandomValues(buffer);
-  return base64UrlEncode(buffer.buffer);
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(input));
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function hashPassword(password: string, salt: string): Promise<string> {
-  return sha256Hex(`${salt}:${password}`);
-}
-
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-async function signPayload(payload: Record<string, JsonValue>, secret: string): Promise<string> {
-  const body = JSON.stringify(payload);
+async function hmacSign(secret: string, data: string) {
   const key = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
   );
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-  return `${btoa(body)}.${base64UrlEncode(signature)}`;
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
+  return base64urlEncode(sig);
 }
 
-async function verifyPayload(token: string, secret: string): Promise<Record<string, JsonValue> | null> {
-  const [bodyB64, sig] = token.split(".");
-  if (!bodyB64 || !sig) return null;
-  const body = atob(bodyB64);
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"]
-  );
-  const isValid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    Uint8Array.from(atob(sig.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
-    encoder.encode(body)
-  );
-  if (!isValid) return null;
-  return JSON.parse(body) as Record<string, JsonValue>;
+function corsHeaders(request: Request) {
+  const origin = request.headers.get("Origin") || "";
+
+  const allowed = [
+    "https://staging.vidcom-admin.pages.dev",
+    "https://vidcom-admin.pages.dev",
+    "https://staging.vidcom-2-life-v3.pages.dev",
+    "https://vidcom-2-life-v3.pages.dev",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+  ];
+
+  const isPagesPreview = /^https:\/\/[a-z0-9]+\.vidcom-admin\.pages\.dev$/i.test(origin);
+  const isViewerPreview = /^https:\/\/[a-z0-9]+\.vidcom-2-life-v3\.pages\.dev$/i.test(origin);
+  const allowOrigin = allowed.includes(origin) || isPagesPreview || isViewerPreview ? origin : "null";
+
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers":
+      request.headers.get("Access-Control-Request-Headers") ||
+      "Content-Type, Authorization",
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
 }
 
-async function buildSignedAssetUrl(origin: string, r2Key: string, secret: string, pathPrefix: string) {
-  const token = await signPayload(
-    {
-      r2Key,
-      exp: Date.now() + 1000 * 60 * 5
+function json(request: Request, body: unknown, status = 200, extra: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...corsHeaders(request),
+      ...extra,
     },
-    secret
-  );
-  return `${origin}${pathPrefix}${encodeURIComponent(r2Key)}?token=${encodeURIComponent(token)}`;
+  });
 }
 
-async function requireAuth(request: Request, env: Env) {
-  const token = parseAuthToken(request);
-  if (!token) return null;
-  const session = await env.DB.prepare(
-    "SELECT token, user_id, expires_at FROM sessions WHERE token = ?"
-  ).bind(token).first<{ token: string; user_id: string; expires_at: string }>();
-  if (!session) return null;
-  if (new Date(session.expires_at).getTime() < Date.now()) {
-    await env.DB.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
-    return null;
-  }
-  const user = await env.DB.prepare(
-    "SELECT id, email, role, is_active FROM users WHERE id = ?"
-  ).bind(session.user_id).first<{ id: string; email: string; role: string; is_active: number }>();
-  if (!user || !user.is_active) return null;
-  return user;
-}
-
-async function parseJsonBody(request: Request): Promise<Record<string, JsonValue> | null> {
-  if (!request.headers.get("content-type")?.includes("application/json")) {
-    return null;
-  }
+async function readBodyAny(request: Request): Promise<any | null> {
+  // Try JSON first
   try {
-    return (await request.json()) as Record<string, JsonValue>;
+    const ct = (request.headers.get("Content-Type") || "").toLowerCase();
+    if (ct.includes("application/json")) {
+      return await request.json();
+    }
+  } catch {}
+
+  // Fallback: try parse raw text as JSON
+  try {
+    const text = await request.text();
+    if (!text) return null;
+    return JSON.parse(text);
   } catch {
     return null;
   }
 }
 
-function assertString(value: JsonValue | undefined, name: string): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+function getBearerToken(request: Request) {
+  const auth = request.headers.get("Authorization") || request.headers.get("authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
 }
 
-function assertNumber(value: JsonValue | undefined, name: string): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+async function issueToken(env: Env, user: User) {
+  const secret = env.SIGNING_SECRET || env.SESSION_SECRET || "staging-signing-secret";
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + 60 * 60 * 24 * 7;
+  const payloadObj = { email: user.email, iat: now, exp };
+  const payload = base64urlEncodeText(JSON.stringify(payloadObj));
+  const sig = await hmacSign(secret, payload);
+  return `${payload}.${sig}`;
 }
 
-function buildQrId(): string {
-  const token = randomToken(8);
-  return token.replace(/[^a-zA-Z0-9]/g, "").slice(0, 10);
+async function verifyToken(env: Env, token: string): Promise<User | null> {
+  const secret = env.SIGNING_SECRET || env.SESSION_SECRET || "staging-signing-secret";
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+
+  const expected = await hmacSign(secret, payload);
+  if (sig !== expected) return null;
+
+  try {
+    const obj = JSON.parse(base64urlDecodeToText(payload)) as { email: string; exp: number };
+    const now = Math.floor(Date.now() / 1000);
+    if (!obj.email || !obj.exp || obj.exp < now) return null;
+    return { email: obj.email };
+  } catch {
+    return null;
+  }
 }
 
-function buildR2Key(kind: string, filename: string): string {
-  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-  return `uploads/${kind}/${crypto.randomUUID()}-${safeName}`;
+async function requireUser(request: Request, env: Env) {
+  const token = getBearerToken(request);
+  if (!token) return null;
+  return await verifyToken(env, token);
+}
+
+function uuid() {
+  // @ts-ignore
+  return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+}
+function nowIso() {
+  return new Date().toISOString();
+}
+function genQrId() {
+  return uuid().replace(/-/g, "").slice(0, 12);
+}
+
+function sanitizeFilename(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return "file";
+  return trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "file";
+}
+
+async function buildUploadToken(env: Env, r2Key: string) {
+  const secret = env.SIGNING_SECRET || env.SESSION_SECRET || "staging-signing-secret";
+  return await hmacSign(secret, `upload:${r2Key}`);
+}
+
+async function verifyUploadToken(env: Env, r2Key: string, token: string | null) {
+  if (!token) return false;
+  const expected = await buildUploadToken(env, r2Key);
+  return token === expected;
+}
+
+async function buildAssetToken(env: Env, assetId: string) {
+  const secret = env.SIGNING_SECRET || env.SESSION_SECRET || "staging-signing-secret";
+  return await hmacSign(secret, `asset:${assetId}`);
+}
+
+async function verifyAssetToken(env: Env, assetId: string, token: string | null) {
+  if (!token) return false;
+  const expected = await buildAssetToken(env, assetId);
+  return token === expected;
+}
+
+type ExperienceRow = {
+  id: string;
+  name: string;
+  qr_id: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+};
+
+function mapExperience(row: ExperienceRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    qr_id: row.qr_id,
+    is_active: Boolean(row.is_active),
+  };
+}
+
+function isJobSecretValid(env: Env, request: Request) {
+  const secret = env.MINDAR_JOB_SECRET || "";
+  const header = request.headers.get("x-job-secret") || "";
+  return secret.length > 0 && header === secret;
+}
+
+async function dispatchMindarJob(env: Env, pairId: string, imagePublicUrl: string, apiBase: string) {
+  if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
+    console.log("MindAR job dispatch skipped: missing GITHUB_TOKEN or GITHUB_REPO");
+    return false;
+  }
+  const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/mindar-generate.yml/dispatches`;
+  const body = {
+    ref: env.GITHUB_REF || "main",
+    inputs: {
+      pairId,
+      imagePublicUrl,
+      apiBase,
+    },
+  };
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      "User-Agent": "vidcom-mindar-dispatch",
+      Accept: "application/vnd.github+json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.log("MindAR dispatch failed", resp.status, text);
+    return false;
+  }
+  return true;
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+  async fetch(request: Request, env: Env) {
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const origin = url.origin;
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
-    }
-
-    if (path === "/health") {
-      return new Response("ok", { status: 200, headers: corsHeaders });
-    }
-
-    if (request.method === "POST" && path === "/dev/seed-admin") {
-      if (env.NODE_ENV !== "development") {
-        return errorResponse("Not available", 404);
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
       }
-      const body = (await parseJsonBody(request)) ?? {};
-      const email = assertString(body.email, "email") ?? "admin@local";
-      const password = assertString(body.password, "password") ?? "admin123";
-      const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?")
-        .bind(email)
-        .first<{ id: string }>();
-      if (existing) {
-        return jsonResponse({ ok: true, email, password, existed: true });
-      }
-      const salt = randomToken(8);
-      const hash = await hashPassword(password, salt);
-      const userId = crypto.randomUUID();
-      await env.DB.prepare(
-        "INSERT INTO users (id, email, password_hash, password_salt, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)"
-      )
-        .bind(userId, email, hash, salt, "admin", nowIso())
-        .run();
-      return jsonResponse({ ok: true, email, password, created: true });
-    }
 
-    if (request.method === "POST" && path === "/auth/login") {
-      const body = await parseJsonBody(request);
-      if (!body) return errorResponse("Expected JSON body");
-      const email = assertString(body.email, "email");
-      const password = assertString(body.password, "password");
-      if (!email || !password) return errorResponse("Missing email or password");
-      const user = await env.DB.prepare(
-        "SELECT id, email, password_hash, password_salt, is_active FROM users WHERE email = ?"
-      ).bind(email).first<{
-        id: string;
-        email: string;
-        password_hash: string;
-        password_salt: string;
-        is_active: number;
-      }>();
-      if (!user || !user.is_active) return errorResponse("Invalid credentials", 401);
-      const hash = await hashPassword(password, user.password_salt);
-      if (hash !== user.password_hash) return errorResponse("Invalid credentials", 401);
-      const token = randomToken(32);
-      const expires = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7);
-      await env.DB.prepare(
-        "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)"
-      )
-        .bind(token, user.id, nowIso(), expires.toISOString())
-        .run();
-      const headers = new Headers();
-      headers.set(
-        "set-cookie",
-        `session_token=${token}; Path=/; HttpOnly; SameSite=Lax`
-      );
-      return jsonResponse({ token }, 200, headers);
-    }
-
-    if (request.method === "POST" && path === "/auth/logout") {
-      const token = parseAuthToken(request);
-      if (token) {
-        await env.DB.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
-      }
-      const headers = new Headers();
-      headers.set(
-        "set-cookie",
-        "session_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
-      );
-      return jsonResponse({ ok: true }, 200, headers);
-    }
-
-    if (request.method === "GET" && path === "/auth/me") {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      return jsonResponse({ user });
-    }
-
-    if (request.method === "POST" && path === "/uploads/sign") {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const body = await parseJsonBody(request);
-      if (!body) return errorResponse("Expected JSON body");
-      const kind = assertString(body.kind, "kind");
-      const mime = assertString(body.mime, "mime");
-      const filename = assertString(body.filename, "filename");
-      const size = assertNumber(body.size, "size");
-      if (!kind || !mime || !filename || size === null) {
-        return errorResponse("Missing upload fields");
-      }
-      if (kind !== "image" && kind !== "video") return errorResponse("Invalid kind");
-      const r2Key = buildR2Key(kind, filename);
-      const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
-      const payload = {
-        r2Key,
-        kind,
-        mime,
-        size,
-        exp: Date.now() + 1000 * 60 * 5
-      };
-      const token = await signPayload(payload, secret);
-      const uploadUrl = `${url.origin}/uploads/put/${encodeURIComponent(r2Key)}?token=${encodeURIComponent(
-        token
-      )}`;
-      return jsonResponse({ uploadUrl, r2Key });
-    }
-
-    if (request.method === "PUT" && path.startsWith("/uploads/put/")) {
-      const token = url.searchParams.get("token");
-      if (!token) return errorResponse("Missing token", 401);
-      const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
-      const payload = await verifyPayload(token, secret);
-      if (!payload) return errorResponse("Invalid token", 401);
-      const r2Key = decodeURIComponent(path.replace("/uploads/put/", ""));
-      if (payload.r2Key !== r2Key) return errorResponse("Token mismatch", 403);
-      const exp = typeof payload.exp === "number" ? payload.exp : 0;
-      if (Date.now() > exp) return errorResponse("Token expired", 403);
-      const body = await request.arrayBuffer();
-      const contentType = request.headers.get("content-type") ?? "application/octet-stream";
-      await env.BUCKET.put(r2Key, body, {
-        httpMetadata: { contentType }
-      });
-      return jsonResponse({ ok: true, r2Key, size: body.byteLength });
-    }
-
-    if (request.method === "POST" && path === "/uploads/complete") {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const body = await parseJsonBody(request);
-      if (!body) return errorResponse("Expected JSON body");
-      const kind = assertString(body.kind, "kind");
-      const r2Key = assertString(body.r2Key, "r2Key");
-      const mime = assertString(body.mime, "mime");
-      const filename = assertString(body.filename, "filename");
-      const size = assertNumber(body.size, "size");
-      if (!kind || !r2Key || !mime || !filename || size === null) {
-        return errorResponse("Missing asset fields");
-      }
-      const id = crypto.randomUUID();
-      await env.DB.prepare(
-        "INSERT INTO assets (id, kind, r2_key, mime, size) VALUES (?, ?, ?, ?, ?)"
-      )
-        .bind(id, kind, r2Key, mime, size)
-        .run();
-      return jsonResponse({ id, kind, r2_key: r2Key, mime, size });
-    }
-
-    if (request.method === "POST" && path === "/experiences") {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const body = await parseJsonBody(request);
-      if (!body) return errorResponse("Expected JSON body");
-      const name = assertString(body.name, "name");
-      if (!name) return errorResponse("Missing name");
-      const id = crypto.randomUUID();
-      let qrId = buildQrId();
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const existing = await env.DB.prepare("SELECT id FROM experiences WHERE qr_id = ?")
-          .bind(qrId)
-          .first<{ id: string }>();
-        if (!existing) break;
-        qrId = buildQrId();
-      }
-      await env.DB.prepare(
-        "INSERT INTO experiences (id, name, qr_id, is_active) VALUES (?, ?, ?, 1)"
-      )
-        .bind(id, name, qrId)
-        .run();
-      return jsonResponse({ id, name, qr_id: qrId, is_active: true });
-    }
-
-    if (request.method === "GET" && path === "/experiences") {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const results = await env.DB.prepare(
-        "SELECT id, name, qr_id, is_active FROM experiences ORDER BY rowid DESC"
-      ).all<{ id: string; name: string; qr_id: string; is_active: number }>();
-      return jsonResponse({
-        experiences: results.results.map((exp) => ({
-          ...exp,
-          is_active: Boolean(exp.is_active)
-        }))
-      });
-    }
-
-    if (path.startsWith("/experiences/") && !path.endsWith("/pairs")) {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const id = path.split("/")[2];
-      if (!id) return errorResponse("Missing id");
-      if (request.method === "GET") {
-        const experience = await env.DB.prepare(
-          "SELECT id, name, qr_id, is_active FROM experiences WHERE id = ?"
-        )
-          .bind(id)
-          .first<{ id: string; name: string; qr_id: string; is_active: number }>();
-        if (!experience) return errorResponse("Not found", 404);
-        return jsonResponse({
-          ...experience,
-          is_active: Boolean(experience.is_active)
+      if (path === "/api/health") {
+        return json(request, {
+          ok: true,
+          service: "vidcom-api",
+          env: env.NODE_ENV || "unknown",
+          build: BUILD,
+          time: new Date().toISOString(),
         });
       }
-      if (request.method === "PUT") {
-        const body = await parseJsonBody(request);
-        if (!body) return errorResponse("Expected JSON body");
-        const name = assertString(body.name, "name");
-        const isActiveValue = body.is_active;
-        const isActive =
-          typeof isActiveValue === "boolean" ? (isActiveValue ? 1 : 0) : null;
-        const hasQrId = Object.prototype.hasOwnProperty.call(body, "qr_id");
-        const qrId = hasQrId ? assertString(body.qr_id, "qr_id") : null;
-        if (hasQrId && !qrId) return errorResponse("Missing qr_id");
-        if (!name && isActive === null && !hasQrId) return errorResponse("No updates provided");
-        if (name) {
-          await env.DB.prepare("UPDATE experiences SET name = ? WHERE id = ?")
-            .bind(name, id)
-            .run();
-        }
-        if (hasQrId && qrId) {
-          await env.DB.prepare("UPDATE experiences SET qr_id = ? WHERE id = ?")
-            .bind(qrId, id)
-            .run();
-        }
-        if (isActive !== null) {
-          await env.DB.prepare("UPDATE experiences SET is_active = ? WHERE id = ?")
-            .bind(isActive, id)
-            .run();
-        }
-        const updated = await env.DB.prepare(
-          "SELECT id, name, qr_id, is_active FROM experiences WHERE id = ?"
-        )
-          .bind(id)
-          .first<{ id: string; name: string; qr_id: string; is_active: number }>();
-        if (!updated) return errorResponse("Not found", 404);
-        return jsonResponse({
-          ...updated,
-          is_active: Boolean(updated.is_active)
-        });
-      }
-      if (request.method === "DELETE") {
-        const existing = await env.DB.prepare("SELECT id FROM experiences WHERE id = ?")
-          .bind(id)
-          .first<{ id: string }>();
-        if (!existing) return errorResponse("Not found", 404);
-        await env.DB.prepare("DELETE FROM pairs WHERE experience_id = ?")
-          .bind(id)
-          .run();
-        await env.DB.prepare("DELETE FROM experiences WHERE id = ?").bind(id).run();
-        return jsonResponse({ ok: true });
-      }
-    }
 
-    if (path.endsWith("/pairs")) {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const experienceId = path.split("/")[2];
-      if (!experienceId) return errorResponse("Missing experience id");
-      if (request.method === "GET") {
-        const results = await env.DB.prepare(
-          "SELECT pairs.id, pairs.image_asset_id, pairs.video_asset_id, pairs.image_fingerprint, pairs.threshold, pairs.priority, pairs.is_active, img.r2_key as image_r2_key, img.mime as image_mime, img.size as image_size, vid.r2_key as video_r2_key, vid.mime as video_mime, vid.size as video_size FROM pairs JOIN assets img ON img.id = pairs.image_asset_id JOIN assets vid ON vid.id = pairs.video_asset_id WHERE pairs.experience_id = ? ORDER BY pairs.rowid DESC"
-        )
-          .bind(experienceId)
-          .all<{
-            id: string;
-            image_asset_id: string;
-            video_asset_id: string;
-            image_fingerprint: string;
-            threshold: number;
-            priority: number;
-            is_active: number;
-            image_r2_key: string;
-            image_mime: string;
-            image_size: number;
-            video_r2_key: string;
-            video_mime: string;
-            video_size: number;
-          }>();
-        const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
-        return jsonResponse({
-          pairs: await Promise.all(
-            results.results.map(async (pair) => ({
-              ...pair,
-              image_fingerprint: JSON.parse(pair.image_fingerprint),
-              is_active: Boolean(pair.is_active),
-              image_url: await buildSignedAssetUrl(url.origin, pair.image_r2_key, secret, "/public/asset/"),
-              video_url: await buildSignedAssetUrl(url.origin, pair.video_r2_key, secret, "/public/asset/")
-            }))
-          )
+      // ---- PUBLIC ASSETS ----
+      if (path.startsWith("/public/assets/") && request.method === "GET") {
+        const assetId = decodeURIComponent(path.slice("/public/assets/".length));
+        if (!assetId) return json(request, { error: "Not Found", build: BUILD }, 404);
+        const asset = await env.DB.prepare(
+          "SELECT id, r2_key, mime FROM assets WHERE id = ? LIMIT 1"
+        ).bind(assetId).first<{ id: string; r2_key: string; mime: string }>();
+        if (!asset) return json(request, { error: "Not Found", build: BUILD }, 404);
+        const obj = await env.BUCKET.get(asset.r2_key);
+        if (!obj) return json(request, { error: "Not Found", build: BUILD }, 404);
+        return new Response(obj.body, {
+          headers: {
+            "Content-Type": asset.mime || "application/octet-stream",
+            ...corsHeaders(request),
+          },
         });
       }
-      if (request.method === "POST") {
-        const body = await parseJsonBody(request);
-        if (!body) return errorResponse("Expected JSON body");
-        const imageAssetId = assertString(body.image_asset_id, "image_asset_id");
-        const videoAssetId = assertString(body.video_asset_id, "video_asset_id");
-        const fingerprint = body.image_fingerprint;
-        if (!imageAssetId || !videoAssetId || typeof fingerprint !== "object") {
-          return errorResponse("Missing or invalid pair fields");
-        }
-        const threshold = assertNumber(body.match_threshold, "match_threshold") ?? 0.8;
-        const priority = assertNumber(body.priority, "priority") ?? 0;
-        const pairId = crypto.randomUUID();
-        await env.DB.prepare(
-          "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
-        )
-          .bind(
-            pairId,
-            experienceId,
-            imageAssetId,
-            videoAssetId,
-            JSON.stringify(fingerprint),
-            threshold,
-            priority
-          )
-          .run();
-        return jsonResponse({
-          id: pairId,
-          experience_id: experienceId,
-          image_asset_id: imageAssetId,
-          video_asset_id: videoAssetId,
-          image_fingerprint: fingerprint,
-          threshold,
-          priority,
-          is_active: true
-        });
-      }
-    }
 
-    if (path.startsWith("/pairs/")) {
-      const user = await requireAuth(request, env);
-      if (!user) return errorResponse("Unauthorized", 401);
-      const pairId = path.split("/")[2];
-      if (!pairId) return errorResponse("Missing pair id");
-      if (request.method === "PUT") {
-        const body = await parseJsonBody(request);
-        if (!body) return errorResponse("Expected JSON body");
-        const updates: string[] = [];
-        const binds: JsonValue[] = [];
-        if (typeof body.is_active === "boolean") {
-          updates.push("is_active = ?");
-          binds.push(body.is_active ? 1 : 0);
-        }
-        if (typeof body.experience_id === "string" && body.experience_id.trim()) {
-          const nextExperienceId = body.experience_id.trim();
-          const existing = await env.DB.prepare("SELECT id FROM experiences WHERE id = ?")
-            .bind(nextExperienceId)
-            .first<{ id: string }>();
-          if (!existing) return errorResponse("Experience not found", 404);
-          updates.push("experience_id = ?");
-          binds.push(nextExperienceId);
-        }
-        if (typeof body.threshold === "number") {
-          updates.push("threshold = ?");
-          binds.push(body.threshold);
-        }
-        if (typeof body.priority === "number") {
-          updates.push("priority = ?");
-          binds.push(body.priority);
-        }
-        if (!updates.length) return errorResponse("No updates provided");
-        binds.push(pairId);
-        await env.DB.prepare(`UPDATE pairs SET ${updates.join(", ")} WHERE id = ?`)
-          .bind(...binds)
-          .run();
-        const updated = await env.DB.prepare(
-          "SELECT id, experience_id, image_asset_id, video_asset_id, image_fingerprint, threshold, priority, is_active FROM pairs WHERE id = ?"
-        )
-          .bind(pairId)
-          .first<{
-            id: string;
-            experience_id: string;
-            image_asset_id: string;
-            video_asset_id: string;
-            image_fingerprint: string;
-            threshold: number;
-            priority: number;
-            is_active: number;
-          }>();
-        if (!updated) return errorResponse("Not found", 404);
-        return jsonResponse({
-          ...updated,
-          image_fingerprint: JSON.parse(updated.image_fingerprint),
-          is_active: Boolean(updated.is_active)
-        });
-      }
-      if (request.method === "DELETE") {
-        await env.DB.prepare("DELETE FROM pairs WHERE id = ?").bind(pairId).run();
-        return jsonResponse({ ok: true });
-      }
-    }
+      // ---- PUBLIC ----
+      const publicMatch = path.match(/^\/public\/experience\/([^/]+)$/);
+      if (publicMatch && request.method === "GET") {
+        const qrId = decodeURIComponent(publicMatch[1]);
+        const exp = await env.DB.prepare(
+          "SELECT id, name, qr_id, is_active, created_at, updated_at FROM experiences WHERE qr_id = ? LIMIT 1"
+        ).bind(qrId).first<ExperienceRow>();
 
-    if (request.method === "GET" && path.startsWith("/public/experience/")) {
-      const qrId = path.split("/")[3];
-      if (!qrId) return errorResponse("Missing qr id");
-      const experienceResults = await env.DB.prepare(
-        "SELECT id, name, qr_id, is_active FROM experiences WHERE qr_id = ? ORDER BY rowid DESC"
-      )
-        .bind(qrId)
-        .all<{ id: string; name: string; qr_id: string; is_active: number }>();
-      const experiences = experienceResults.results.map((exp) => ({
-        ...exp,
-        is_active: Boolean(exp.is_active)
-      }));
-      if (!experiences.length) return errorResponse("Not found", 404);
-      const activeExperiences = experiences.filter((exp) => exp.is_active);
-      if (!activeExperiences.length) return errorResponse("Not found", 404);
-      const placeholders = activeExperiences.map(() => "?").join(",");
-      const pairs = await env.DB.prepare(
-        `SELECT pairs.id, pairs.experience_id, pairs.image_asset_id, pairs.video_asset_id, pairs.image_fingerprint, pairs.threshold, pairs.priority, assets.r2_key as video_r2_key, assets.mime as video_mime FROM pairs JOIN assets ON assets.id = pairs.video_asset_id WHERE pairs.experience_id IN (${placeholders}) AND pairs.is_active = 1`
-      )
-        .bind(...activeExperiences.map((exp) => exp.id))
-        .all<{
+        if (!exp || !exp.is_active) {
+          return json(request, { error: "Not Found", build: BUILD }, 404);
+        }
+
+        const pair = await env.DB.prepare(
+          "SELECT id, image_asset_id, video_asset_id, mind_target_asset_id, mind_target_status, threshold, priority, is_active FROM pairs WHERE experience_id = ? AND is_active = 1 ORDER BY priority DESC, id DESC LIMIT 1"
+        ).bind(exp.id).first<{
           id: string;
-          experience_id: string;
           image_asset_id: string;
           video_asset_id: string;
-          image_fingerprint: string;
+          mind_target_asset_id: string | null;
+          mind_target_status: string | null;
           threshold: number;
           priority: number;
-          video_r2_key: string;
-          video_mime: string;
+          is_active: number;
         }>();
-      const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
-      const signedPairs = await Promise.all(
-        pairs.results.map(async (pair) => {
-          const videoUrl = await buildSignedAssetUrl(url.origin, pair.video_r2_key, secret, "/public/video/");
-          return {
-            id: pair.id,
-            experience_id: pair.experience_id,
-            image_asset_id: pair.image_asset_id,
-            video_asset_id: pair.video_asset_id,
-            image_fingerprint: JSON.parse(pair.image_fingerprint),
-            threshold: pair.threshold,
-            priority: pair.priority,
-            video_url: videoUrl,
-            video_mime: pair.video_mime
-          };
-        })
-      );
-      const primaryExperience = activeExperiences[0];
-      return jsonResponse({
-        experience: {
-          id: primaryExperience.id,
-          name: primaryExperience.name,
-          qr_id: primaryExperience.qr_id
-        },
-        experiences: experiences.map((exp) => ({
-          id: exp.id,
-          name: exp.name,
-          is_active: exp.is_active
-        })),
-        pairs: signedPairs
-      });
-    }
 
-    if (request.method === "GET" && (path.startsWith("/public/video/") || path.startsWith("/public/asset/"))) {
-      const token = url.searchParams.get("token");
-      if (!token) return errorResponse("Missing token", 401);
-      const secret = env.SIGNING_SECRET ?? "dev-signing-secret";
-      const payload = await verifyPayload(token, secret);
-      if (!payload) return errorResponse("Invalid token", 401);
-      const exp = typeof payload.exp === "number" ? payload.exp : 0;
-      if (Date.now() > exp) return errorResponse("Token expired", 403);
-      const prefix = path.startsWith("/public/video/") ? "/public/video/" : "/public/asset/";
-      const r2Key = decodeURIComponent(path.replace(prefix, ""));
-      if (payload.r2Key !== r2Key) return errorResponse("Token mismatch", 403);
-      const obj = await env.BUCKET.get(r2Key);
-      if (!obj) return errorResponse("Not found", 404);
-      const headers = new Headers();
-      if (obj.httpMetadata?.contentType) {
-        headers.set("content-type", obj.httpMetadata.contentType);
+        let mindarTargetUrl: string | null = null;
+        let videoUrl: string | null = null;
+        if (pair?.mind_target_status === "ready" && pair?.mind_target_asset_id) {
+          mindarTargetUrl = `${origin}/public/assets/${pair.mind_target_asset_id}`;
+        }
+        if (pair?.video_asset_id) {
+          videoUrl = `${origin}/public/assets/${pair.video_asset_id}`;
+        }
+
+        return json(
+          request,
+          {
+            ok: true,
+            experience: mapExperience(exp),
+            mindarTargetUrl,
+            videoUrl,
+            mind_target_status: pair?.mind_target_status ?? null,
+            build: BUILD,
+          },
+          200
+        );
       }
-      return new Response(obj.body, {
-        status: 200,
-        headers: { ...corsHeaders, ...Object.fromEntries(headers) }
-      });
-    }
 
-    return errorResponse("Not found", 404);
-  }
+      // ---- AUTH ----
+      if (path === "/auth/login" && request.method === "POST") {
+        const body = await readBodyAny(request);
+        const email = String(body?.email || "").trim().toLowerCase();
+        const password = String(body?.password || "");
+
+        // HARD-CODED VIBE LOGIN (for now)
+        if (!(email === "admin@local" && password === "admin123")) {
+          return json(request, { error: "Invalid credentials", build: BUILD, seen_email: email }, 401);
+        }
+
+        const token = await issueToken(env, { email });
+        return json(request, { token, build: BUILD }, 200);
+      }
+
+      if (path === "/auth/me" && request.method === "GET") {
+        const token = getBearerToken(request);
+        if (!token) return json(request, { error: "Unauthorized", build: BUILD }, 401);
+
+        const user = await verifyToken(env, token);
+        if (!user) return json(request, { error: "Unauthorized", build: BUILD }, 401);
+
+        return json(request, { ok: true, user, build: BUILD }, 200);
+      }
+
+      if (path === "/auth/logout" && request.method === "POST") {
+        return json(request, { ok: true, build: BUILD }, 200);
+      }
+
+      // Require auth for protected routes
+      const isUploadPut = path.startsWith("/uploads/put/");
+      const user = await requireUser(request, env);
+      const needsAuth =
+        url.pathname.startsWith("/experiences") ||
+        url.pathname.startsWith("/pairs") ||
+        url.pathname.startsWith("/uploads");
+
+      if (needsAuth && !user && !isUploadPut && !isJobSecretValid(env, request)) {
+        return json(request, { error: "Unauthorized", build: BUILD }, 401);
+      }
+
+      // ---- UPLOADS ----
+      if (path === "/uploads/sign" && request.method === "POST") {
+        const body = await readBodyAny(request);
+        const kind = String(body?.kind || "").trim();
+        const mime = String(body?.mime || "application/octet-stream").trim();
+        const filename = String(body?.filename || "file").trim();
+        const r2Key = `${kind}/${uuid()}-${sanitizeFilename(filename)}`;
+        const token = await buildUploadToken(env, r2Key);
+        const uploadUrl = `${origin}/uploads/put/${encodeURIComponent(r2Key)}?token=${encodeURIComponent(
+          token
+        )}&mime=${encodeURIComponent(mime)}`;
+        return json(request, { uploadUrl, r2Key, build: BUILD }, 200);
+      }
+
+      if (path.startsWith("/uploads/put/") && request.method === "PUT") {
+        const r2Key = decodeURIComponent(path.slice("/uploads/put/".length));
+        if (!r2Key) return json(request, { error: "Not Found", build: BUILD }, 404);
+        const token = url.searchParams.get("token");
+        const ok = await verifyUploadToken(env, r2Key, token);
+        if (!ok) return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        const mime = url.searchParams.get("mime") || "application/octet-stream";
+        const data = await request.arrayBuffer();
+        await env.BUCKET.put(r2Key, data, {
+          httpMetadata: { contentType: mime },
+        });
+        return json(request, { ok: true, r2Key, build: BUILD }, 200);
+      }
+
+      if (path === "/uploads/complete" && request.method === "POST") {
+        const body = await readBodyAny(request);
+        const kind = String(body?.kind || "").trim();
+        const r2Key = String(body?.r2Key || "").trim();
+        const mime = String(body?.mime || "application/octet-stream").trim();
+        const size = Number(body?.size || 0);
+        if (!kind || !r2Key) return json(request, { error: "Invalid upload", build: BUILD }, 400);
+
+        const id = uuid();
+        await env.DB.prepare(
+          "INSERT INTO assets (id, kind, r2_key, mime, size) VALUES (?, ?, ?, ?, ?)"
+        ).bind(id, kind, r2Key, mime, size).run();
+
+        const assetToken = await buildAssetToken(env, id);
+        return json(
+          request,
+          {
+            id,
+            kind,
+            r2_key: r2Key,
+            mime,
+            size,
+            url: `${origin}/assets/${id}?token=${encodeURIComponent(assetToken)}`,
+            build: BUILD,
+          },
+          200
+        );
+      }
+
+      // ---- ASSETS (admin) ----
+      if (path.startsWith("/assets/") && request.method === "GET") {
+        const assetId = decodeURIComponent(path.slice("/assets/".length));
+        if (!assetId) return json(request, { error: "Not Found", build: BUILD }, 404);
+        const assetToken = url.searchParams.get("token");
+        const tokenOk = await verifyAssetToken(env, assetId, assetToken);
+        if (!tokenOk && !user) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        const asset = await env.DB.prepare(
+          "SELECT id, r2_key, mime FROM assets WHERE id = ? LIMIT 1"
+        ).bind(assetId).first<{ id: string; r2_key: string; mime: string }>();
+        if (!asset) return json(request, { error: "Not Found", build: BUILD }, 404);
+        const obj = await env.BUCKET.get(asset.r2_key);
+        if (!obj) return json(request, { error: "Not Found", build: BUILD }, 404);
+        return new Response(obj.body, {
+          headers: {
+            "Content-Type": asset.mime || "application/octet-stream",
+            ...corsHeaders(request),
+          },
+        });
+      }
+
+
+      // ---- MINDAR JOBS ----
+      if (path === "/jobs/mindar/dispatch" && request.method === "POST") {
+        if (!user) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        const body = await readBodyAny(request);
+        const pairId = String(body?.pairId || "").trim();
+        const imageAssetId = String(body?.image_asset_id || "").trim();
+        if (!pairId || !imageAssetId) {
+          return json(request, { error: "Missing pairId or image_asset_id", build: BUILD }, 400);
+        }
+        const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
+        const t = nowIso();
+        await env.DB.prepare(
+          "UPDATE pairs SET mind_target_status = ?, mind_target_error = NULL, mind_target_requested_at = ? WHERE id = ?"
+        ).bind("pending", t, pairId).run();
+        const ok = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+        if (!ok) {
+          await env.DB.prepare(
+            "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
+          ).bind("failed", "Dispatch failed", pairId).run();
+        }
+        return json(request, { ok, build: BUILD }, 200);
+      }
+
+      if (path === "/jobs/mindar/complete" && request.method === "POST") {
+        if (!isJobSecretValid(env, request)) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        const body = await readBodyAny(request);
+        const pairId = String(body?.pairId || "").trim();
+        const mindAssetId = String(body?.mindAssetId || "").trim();
+        const errorMessage = body?.error ? String(body.error) : "";
+        if (!pairId) {
+          return json(request, { error: "Missing pairId", build: BUILD }, 400);
+        }
+        const t = nowIso();
+        if (errorMessage || !mindAssetId) {
+          await env.DB.prepare(
+            "UPDATE pairs SET mind_target_status = ?, mind_target_error = ?, mind_target_completed_at = ? WHERE id = ?"
+          ).bind("failed", errorMessage || "MindAR generation failed", t, pairId).run();
+          return json(request, { ok: false, error: errorMessage || "MindAR generation failed", build: BUILD }, 200);
+        }
+        await env.DB.prepare(
+          "UPDATE pairs SET mind_target_asset_id = ?, mind_target_status = ?, mind_target_error = NULL, mind_target_completed_at = ? WHERE id = ?"
+        ).bind(mindAssetId, "ready", t, pairId).run();
+        return json(request, { ok: true, build: BUILD }, 200);
+      }
+
+      // ---- EXPERIENCES ----
+      if (path === "/experiences" && request.method === "GET") {
+        const res = await env.DB.prepare(
+          "SELECT id, name, qr_id, is_active, created_at, updated_at FROM experiences ORDER BY created_at DESC"
+        ).all<ExperienceRow>();
+        return json(request, { experiences: (res.results || []).map(mapExperience), build: BUILD }, 200);
+      }
+
+      if (path === "/experiences" && request.method === "POST") {
+        const body = await readBodyAny(request);
+        const name = String(body?.name || "").trim();
+        if (!name) return json(request, { error: "Name is required", build: BUILD }, 400);
+
+        const id = uuid();
+        const qr_id = genQrId();
+        const t = nowIso();
+
+        await env.DB.prepare(
+          "INSERT INTO experiences (id, name, qr_id, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)"
+        ).bind(id, name, qr_id, t, t).run();
+
+        return json(request, { id, name, qr_id, is_active: true, build: BUILD }, 200);
+      }
+
+      const expMatch = path.match(/^\/experiences\/([^/]+)$/);
+      if (expMatch && request.method === "GET") {
+        const id = decodeURIComponent(expMatch[1]);
+        const exp = await env.DB.prepare(
+          "SELECT id, name, qr_id, is_active, created_at, updated_at FROM experiences WHERE id = ? LIMIT 1"
+        ).bind(id).first<ExperienceRow>();
+        if (!exp) return json(request, { error: "Not Found", build: BUILD }, 404);
+        return json(request, mapExperience(exp), 200);
+      }
+
+      if (expMatch && request.method === "PUT") {
+        const id = decodeURIComponent(expMatch[1]);
+        const body = await readBodyAny(request);
+        const name = body?.name !== undefined ? String(body?.name || "").trim() : null;
+        const isActive = body?.is_active !== undefined ? Boolean(body?.is_active) : null;
+        const qrId = body?.qr_id !== undefined ? String(body?.qr_id || "").trim() : null;
+
+        const existing = await env.DB.prepare(
+          "SELECT id, name, qr_id, is_active, created_at, updated_at FROM experiences WHERE id = ? LIMIT 1"
+        ).bind(id).first<ExperienceRow>();
+        if (!existing) return json(request, { error: "Not Found", build: BUILD }, 404);
+
+        const nextName = name ?? existing.name;
+        const nextQr = qrId ?? existing.qr_id;
+        const nextActive = isActive === null ? existing.is_active : isActive ? 1 : 0;
+        const t = nowIso();
+
+        await env.DB.prepare(
+          "UPDATE experiences SET name = ?, qr_id = ?, is_active = ?, updated_at = ? WHERE id = ?"
+        ).bind(nextName, nextQr, nextActive, t, id).run();
+
+        return json(request, { id, name: nextName, qr_id: nextQr, is_active: Boolean(nextActive), build: BUILD }, 200);
+      }
+
+      if (expMatch && request.method === "DELETE") {
+        const id = decodeURIComponent(expMatch[1]);
+        await env.DB.prepare("DELETE FROM pairs WHERE experience_id = ?").bind(id).run();
+        const res = await env.DB.prepare("DELETE FROM experiences WHERE id = ?").bind(id).run();
+        if (!res.success) return json(request, { error: "Not Found", build: BUILD }, 404);
+        return json(request, { ok: true, build: BUILD }, 200);
+      }
+
+      const expPairsMatch = path.match(/^\/experiences\/([^/]+)\/pairs$/);
+      if (expPairsMatch && request.method === "GET") {
+        const id = decodeURIComponent(expPairsMatch[1]);
+        const res = await env.DB.prepare(
+          `SELECT p.id,
+                  p.experience_id,
+                  p.image_asset_id,
+                  p.video_asset_id,
+                  p.mind_target_asset_id,
+                  p.mind_target_status,
+                  p.mind_target_error,
+                  p.mind_target_requested_at,
+                  p.mind_target_completed_at,
+                  p.image_fingerprint,
+                  p.threshold,
+                  p.priority,
+                  p.is_active,
+                  ai.r2_key AS image_r2_key,
+                  ai.mime AS image_mime,
+                  ai.size AS image_size,
+                  am.r2_key AS mind_r2_key,
+                  am.mime AS mind_mime,
+                  am.size AS mind_size,
+                  av.r2_key AS video_r2_key,
+                  av.mime AS video_mime,
+                  av.size AS video_size
+           FROM pairs p
+           LEFT JOIN assets ai ON ai.id = p.image_asset_id
+           LEFT JOIN assets am ON am.id = p.mind_target_asset_id
+           LEFT JOIN assets av ON av.id = p.video_asset_id
+           WHERE p.experience_id = ?
+           ORDER BY p.priority DESC, p.id DESC`
+        ).bind(id).all<any>();
+
+        const pairs = await Promise.all((res.results || []).map(async (row: any) => {
+          let fingerprint = row.image_fingerprint;
+          try {
+            fingerprint = row.image_fingerprint ? JSON.parse(row.image_fingerprint) : row.image_fingerprint;
+          } catch {}
+          const imageToken = row.image_asset_id ? await buildAssetToken(env, row.image_asset_id) : null;
+          const videoToken = row.video_asset_id ? await buildAssetToken(env, row.video_asset_id) : null;
+          return {
+            id: row.id,
+            experience_id: row.experience_id,
+            image_asset_id: row.image_asset_id,
+            video_asset_id: row.video_asset_id,
+            mind_target_asset_id: row.mind_target_asset_id,
+            mind_target_status: row.mind_target_status,
+            mind_target_error: row.mind_target_error,
+            mind_target_requested_at: row.mind_target_requested_at,
+            mind_target_completed_at: row.mind_target_completed_at,
+            image_fingerprint: fingerprint,
+            threshold: row.threshold,
+            priority: row.priority,
+            is_active: Boolean(row.is_active),
+            image_r2_key: row.image_r2_key,
+            mind_r2_key: row.mind_r2_key,
+            video_r2_key: row.video_r2_key,
+            image_mime: row.image_mime,
+            mind_mime: row.mind_mime,
+            video_mime: row.video_mime,
+            image_size: row.image_size,
+            mind_size: row.mind_size,
+            video_size: row.video_size,
+            image_url: row.image_asset_id
+              ? `${origin}/assets/${row.image_asset_id}?token=${encodeURIComponent(imageToken)}`
+              : null,
+            mind_target_url: row.mind_target_asset_id
+              ? `${origin}/assets/${row.mind_target_asset_id}?token=${encodeURIComponent(
+                  await buildAssetToken(env, row.mind_target_asset_id)
+                )}`
+              : null,
+            video_url: row.video_asset_id
+              ? `${origin}/assets/${row.video_asset_id}?token=${encodeURIComponent(videoToken)}`
+              : null,
+          };
+        }));
+
+        return json(request, { pairs, build: BUILD }, 200);
+      }
+
+      if (expPairsMatch && request.method === "POST") {
+        const expId = decodeURIComponent(expPairsMatch[1]);
+        const body = await readBodyAny(request);
+        const imageAssetId = String(body?.image_asset_id || "").trim();
+        const videoAssetId = String(body?.video_asset_id || "").trim();
+        const fingerprint = body?.image_fingerprint ?? null;
+        const threshold = Number(body?.match_threshold ?? body?.threshold ?? 0.8);
+        const priority = Number(body?.priority ?? 0);
+
+        if (!imageAssetId || !videoAssetId) {
+          return json(request, { error: "Missing assets", build: BUILD }, 400);
+        }
+
+        const id = uuid();
+        await env.DB.prepare(
+          "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, mind_target_status, mind_target_requested_at, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)"
+        ).bind(
+          id,
+          expId,
+          imageAssetId,
+          videoAssetId,
+          "pending",
+          nowIso(),
+          fingerprint ? JSON.stringify(fingerprint) : null,
+          threshold,
+          priority
+        ).run();
+
+        const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
+        const ok = await dispatchMindarJob(env, id, imagePublicUrl, origin);
+        if (!ok) {
+          await env.DB.prepare(
+            "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
+          ).bind("failed", "Dispatch failed", id).run();
+        }
+        return json(request, { id, build: BUILD }, 200);
+      }
+
+      const pairMatch = path.match(/^\/pairs\/([^/]+)$/);
+      if (pairMatch && request.method === "PUT") {
+        const pairId = decodeURIComponent(pairMatch[1]);
+        const body = await readBodyAny(request);
+        const experienceId = body?.experience_id ? String(body.experience_id).trim() : null;
+        const imageAssetId = body?.image_asset_id ? String(body.image_asset_id).trim() : null;
+        const videoAssetId = body?.video_asset_id ? String(body.video_asset_id).trim() : null;
+        const fingerprint = body?.image_fingerprint ?? null;
+        const threshold = body?.threshold !== undefined ? Number(body.threshold) : null;
+        const priority = body?.priority !== undefined ? Number(body.priority) : null;
+        const isActive = body?.is_active !== undefined ? Boolean(body.is_active) : null;
+
+        const existing = await env.DB.prepare(
+          "SELECT id, experience_id, image_asset_id, video_asset_id, image_fingerprint, mind_target_asset_id, mind_target_status, mind_target_requested_at, threshold, priority, is_active FROM pairs WHERE id = ? LIMIT 1"
+        ).bind(pairId).first<any>();
+        if (!existing) return json(request, { error: "Not Found", build: BUILD }, 404);
+
+        const nextExperienceId = experienceId ?? existing.experience_id;
+        const nextImageAssetId = imageAssetId ?? existing.image_asset_id;
+        const nextVideoAssetId = videoAssetId ?? existing.video_asset_id;
+        const nextFingerprint =
+          fingerprint !== null && fingerprint !== undefined
+            ? JSON.stringify(fingerprint)
+            : existing.image_fingerprint;
+        const nextThreshold = threshold ?? existing.threshold;
+        const nextPriority = priority ?? existing.priority;
+        const nextActive = isActive === null ? existing.is_active : isActive ? 1 : 0;
+        const imageChanged = imageAssetId && imageAssetId !== existing.image_asset_id;
+        const t = nowIso();
+        const nextMindStatus = imageChanged ? "pending" : existing.mind_target_status;
+        const nextMindAssetId = imageChanged ? null : existing.mind_target_asset_id;
+        const nextMindRequestedAt = imageChanged ? t : existing.mind_target_requested_at;
+
+        await env.DB.prepare(
+          "UPDATE pairs SET experience_id = ?, image_asset_id = ?, video_asset_id = ?, image_fingerprint = ?, mind_target_asset_id = ?, mind_target_status = ?, mind_target_error = NULL, mind_target_requested_at = ?, threshold = ?, priority = ?, is_active = ? WHERE id = ?"
+        ).bind(
+          nextExperienceId,
+          nextImageAssetId,
+          nextVideoAssetId,
+          nextFingerprint,
+          nextMindAssetId,
+          nextMindStatus,
+          nextMindRequestedAt,
+          nextThreshold,
+          nextPriority,
+          nextActive,
+          pairId
+        ).run();
+
+        if (imageChanged) {
+          const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
+          const ok = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+          if (!ok) {
+            await env.DB.prepare(
+              "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
+            ).bind("failed", "Dispatch failed", pairId).run();
+          }
+        }
+
+        return json(request, { ok: true, build: BUILD }, 200);
+      }
+
+      if (pairMatch && request.method === "DELETE") {
+        const pairId = decodeURIComponent(pairMatch[1]);
+        await env.DB.prepare("DELETE FROM pairs WHERE id = ?").bind(pairId).run();
+        return json(request, { ok: true, build: BUILD }, 200);
+      }
+
+      return json(request, { error: "Not Found", build: BUILD, path, method: request.method }, 404);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Internal Server Error";
+      return json(request, { error: message, build: BUILD }, 500);
+    }
+  },
 };

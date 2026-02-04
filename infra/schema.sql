@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS experiences (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   qr_id TEXT NOT NULL,
-  is_active INTEGER NOT NULL DEFAULT 1
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -37,13 +39,19 @@ CREATE TABLE IF NOT EXISTS pairs (
   experience_id TEXT NOT NULL,
   image_asset_id TEXT NOT NULL,
   video_asset_id TEXT NOT NULL,
+  mind_target_asset_id TEXT,
+  mind_target_status TEXT,
+  mind_target_error TEXT,
+  mind_target_requested_at TEXT,
+  mind_target_completed_at TEXT,
   image_fingerprint TEXT NOT NULL,
   threshold REAL NOT NULL,
   priority INTEGER NOT NULL,
   is_active INTEGER NOT NULL DEFAULT 1,
   FOREIGN KEY (experience_id) REFERENCES experiences(id),
   FOREIGN KEY (image_asset_id) REFERENCES assets(id),
-  FOREIGN KEY (video_asset_id) REFERENCES assets(id)
+  FOREIGN KEY (video_asset_id) REFERENCES assets(id),
+  FOREIGN KEY (mind_target_asset_id) REFERENCES assets(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pairs_experience ON pairs(experience_id);

@@ -1,0 +1,42 @@
+name: MindAR Generate
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairId:
+        description: "Pair ID to attach the .mind file to"
+        required: true
+        type: string
+      imagePublicUrl:
+        description: "Public image URL for target generation"
+        required: true
+        type: string
+      apiBase:
+        description: "API base URL"
+        required: true
+        default: "https://vidcom-api-staging.vidcomfilmworks.workers.dev"
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Puppeteer
+        run: npm install puppeteer
+
+      - name: Generate MindAR target
+        env:
+          PAIR_ID: ${{ inputs.pairId }}
+          IMAGE_PUBLIC_URL: ${{ inputs.imagePublicUrl }}
+          API_BASE: ${{ inputs.apiBase }}
+          MINDAR_JOB_SECRET: ${{ secrets.MINDAR_JOB_SECRET }}
+        run: node scripts/mindar-generate.mjs

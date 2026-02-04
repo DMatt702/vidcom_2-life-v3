@@ -3,6 +3,7 @@ import QRCode from "qrcode";
 import { generateImageFingerprint, type ImageFingerprint } from "@vidcom/shared";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
+const VIEWER_BASE = import.meta.env.VITE_VIEWER_BASE_URL ?? "https://vidcom-2-life-v3.pages.dev";
 
 type Experience = {
   id: string;
@@ -15,17 +16,26 @@ type Pair = {
   id: string;
   image_asset_id: string;
   video_asset_id: string;
+  mind_target_asset_id?: string;
+  mind_target_status?: string | null;
+  mind_target_error?: string | null;
+  mind_target_requested_at?: string | null;
+  mind_target_completed_at?: string | null;
   image_fingerprint: ImageFingerprint;
   threshold: number;
   priority: number;
   is_active: boolean;
   image_r2_key?: string;
+  mind_r2_key?: string;
   video_r2_key?: string;
   image_url?: string;
+  mind_target_url?: string;
   video_url?: string;
   image_mime?: string;
+  mind_mime?: string;
   video_mime?: string;
   image_size?: number;
+  mind_size?: number;
   video_size?: number;
 };
 
@@ -56,6 +66,21 @@ function sanitizeFilename(name: string) {
   const trimmed = name.trim();
   const safe = trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
   return safe || "experience";
+}
+
+function formatMindStatus(status?: string | null) {
+  if (!status) return "Unknown";
+  if (status === "ready") return "Ready";
+  if (status === "pending") return "Generating";
+  if (status === "failed") return "Failed";
+  return status;
+}
+
+function mindStatusClass(status?: string | null) {
+  if (status === "ready") return "status-ready";
+  if (status === "pending") return "status-pending";
+  if (status === "failed") return "status-failed";
+  return "status-unknown";
 }
 
 export default function App() {
@@ -361,7 +386,8 @@ export default function App() {
   async function handleDownloadQr() {
     if (!selectedExperience?.qr_id) return;
     try {
-      const dataUrl = await QRCode.toDataURL(selectedExperience.qr_id, {
+      const viewerUrl = `${VIEWER_BASE}/v/${selectedExperience.qr_id}`;
+      const dataUrl = await QRCode.toDataURL(viewerUrl, {
         width: 1024,
         margin: 2,
         errorCorrectionLevel: "H"
@@ -478,6 +504,26 @@ export default function App() {
       }
     } catch (error) {
       pushToast("error", error instanceof Error ? error.message : "Failed to move pair.");
+    }
+  }
+
+  async function handleRetryMindar(pair: Pair) {
+    if (!pair.image_asset_id) {
+      pushToast("error", "Pair is missing image asset.");
+      return;
+    }
+    try {
+      await apiRequest("/jobs/mindar/dispatch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pairId: pair.id, image_asset_id: pair.image_asset_id })
+      });
+      pushToast("info", "MindAR generation dispatched.");
+      if (selectedExperienceId) {
+        await loadPairs(selectedExperienceId);
+      }
+    } catch (error) {
+      pushToast("error", error instanceof Error ? error.message : "Failed to dispatch MindAR job.");
     }
   }
 
@@ -669,6 +715,7 @@ export default function App() {
                         <th>ID</th>
                         <th>Image</th>
                         <th>Video</th>
+                        <th>Target</th>
                         <th>Threshold</th>
                         <th>Priority</th>
                         <th>Active</th>
@@ -702,15 +749,44 @@ export default function App() {
                               </div>
                               <div className="mono">{pair.video_asset_id}</div>
                               {pair.video_url ? (
-                                <a className="link" href={pair.video_url} target="_blank" rel="noreferrer">
-                                  View
-                                </a>
+                                <>
+                                  <a className="link" href={pair.video_url} target="_blank" rel="noreferrer">
+                                    View
+                                  </a>
+                                  <video
+                                    className="thumb"
+                                    src={pair.video_url}
+                                    controls
+                                    muted
+                                    playsInline
+                                    preload="metadata"
+                                  />
+                                </>
                               ) : (
                                 <span className="muted">No signed URL</span>
                               )}
                             </div>
                           </td>
+                          <td>
+                            <div className="stack">
+                              <span className={`status-pill ${mindStatusClass(pair.mind_target_status)}`}>
+                                {formatMindStatus(pair.mind_target_status)}
+                              </span>
+                              {pair.mind_target_error && (
+                                <span className="muted small">{pair.mind_target_error}</span>
+                              )}
+                              <button
+                                type="button"
+                                className="secondary tiny"
+                                onClick={() => handleRetryMindar(pair)}
+                                disabled={!pair.image_asset_id}
+                              >
+                                Retry
+                              </button>
+                            </div>
+                          </td>
                           <td>{pair.threshold.toFixed(2)}</td>
+
                           <td>{pair.priority}</td>
                           <td>{pair.is_active ? "Yes" : "No"}</td>
                           <td>
@@ -1006,6 +1082,32 @@ function AppStyles() {
         background: #fee2e2;
         color: #991b1b;
       }
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        width: fit-content;
+      }
+      .status-ready {
+        background: #dcfce7;
+        color: #166534;
+      }
+      .status-pending {
+        background: #fde68a;
+        color: #92400e;
+      }
+      .status-failed {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      .status-unknown {
+        background: #e2e8f0;
+        color: #0f172a;
+      }
       .label {
         font-size: 0.75rem;
         text-transform: uppercase;
@@ -1024,6 +1126,11 @@ function AppStyles() {
       button.secondary {
         background: #e2e8f0;
         color: #0f172a;
+      }
+      button.tiny {
+        padding: 6px 10px;
+        border-radius: 8px;
+        font-size: 0.75rem;
       }
       button.danger {
         background: #dc2626;
@@ -1103,6 +1210,9 @@ function AppStyles() {
       .inline-error {
         color: #dc2626;
         font-size: 0.8rem;
+      }
+      .small {
+        font-size: 0.75rem;
       }
       .preview {
         margin-top: 12px;
