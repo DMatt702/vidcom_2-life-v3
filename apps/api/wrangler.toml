@@ -26,6 +26,7 @@ NODE_ENV = "staging"
 SESSION_SECRET = "staging-session-secret"
 SIGNING_SECRET = "staging-signing-secret"
 GITHUB_REF = "v4-clean-rebuild"
+GITHUB_REPO = "DMatt702/vidcom_2-life-v3"
 
 [[env.staging.d1_databases]]
 binding = "DB"

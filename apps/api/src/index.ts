@@ -205,7 +205,7 @@ function isJobSecretValid(env: Env, request: Request) {
 async function dispatchMindarJob(env: Env, pairId: string, imagePublicUrl: string, apiBase: string) {
   if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
     console.log("MindAR job dispatch skipped: missing GITHUB_TOKEN or GITHUB_REPO");
-    return false;
+    return { ok: false, error: "Missing GITHUB_TOKEN or GITHUB_REPO" };
   }
   const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/mindar-generate.yml/dispatches`;
   const body = {
@@ -229,9 +229,9 @@ async function dispatchMindarJob(env: Env, pairId: string, imagePublicUrl: strin
   if (!resp.ok) {
     const text = await resp.text();
     console.log("MindAR dispatch failed", resp.status, text);
-    return false;
+    return { ok: false, error: `Dispatch failed (${resp.status}): ${text || "unknown"}` };
   }
-  return true;
+  return { ok: true };
 }
 
 export default {
@@ -459,13 +459,13 @@ export default {
         await env.DB.prepare(
           "UPDATE pairs SET mind_target_status = ?, mind_target_error = NULL, mind_target_requested_at = ? WHERE id = ?"
         ).bind("pending", t, pairId).run();
-        const ok = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
-        if (!ok) {
+        const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+        if (!result.ok) {
           await env.DB.prepare(
             "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
-          ).bind("failed", "Dispatch failed", pairId).run();
+          ).bind("failed", result.error || "Dispatch failed", pairId).run();
         }
-        return json(request, { ok, build: BUILD }, 200);
+        return json(request, { ok: result.ok, error: result.error || null, build: BUILD }, 200);
       }
 
       if (path === "/jobs/mindar/complete" && request.method === "POST") {
@@ -668,11 +668,11 @@ export default {
         ).run();
 
         const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
-        const ok = await dispatchMindarJob(env, id, imagePublicUrl, origin);
-        if (!ok) {
+        const result = await dispatchMindarJob(env, id, imagePublicUrl, origin);
+        if (!result.ok) {
           await env.DB.prepare(
             "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
-          ).bind("failed", "Dispatch failed", id).run();
+          ).bind("failed", result.error || "Dispatch failed", id).run();
         }
         return json(request, { id, build: BUILD }, 200);
       }
@@ -728,11 +728,11 @@ export default {
 
         if (imageChanged) {
           const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
-          const ok = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
-          if (!ok) {
+          const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+          if (!result.ok) {
             await env.DB.prepare(
               "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
-            ).bind("failed", "Dispatch failed", pairId).run();
+            ).bind("failed", result.error || "Dispatch failed", pairId).run();
           }
         }
 
