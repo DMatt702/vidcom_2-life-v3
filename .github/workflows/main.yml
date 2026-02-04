@@ -1,0 +1,66 @@
+name: Generate MindAR Target
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairId:
+        required: true
+        type: string
+      imagePublicUrl:
+        required: true
+        type: string
+      apiBase:
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: |
+          npm install puppeteer
+          npm install -g http-server
+
+      - name: Generate .mind file
+        run: |
+          node scripts/mindar-generate.mjs "${{ inputs.imagePublicUrl }}" target.mind
+
+      - name: Upload .mind via API
+        env:
+          API_BASE: ${{ inputs.apiBase }}
+          JOB_SECRET: ${{ secrets.MINDAR_JOB_SECRET }}
+        run: |
+          SIGN=$(curl -s -X POST "$API_BASE/uploads/sign" \
+            -H "Content-Type: application/json" \
+            -H "x-job-secret: $JOB_SECRET" \
+            -d '{"filename":"target.mind","contentType":"application/octet-stream"}')
+
+          PUT_URL=$(echo $SIGN | jq -r .putUrl)
+          ASSET_ID=$(echo $SIGN | jq -r .assetId)
+
+          curl -X PUT "$PUT_URL" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @target.mind
+
+          curl -X POST "$API_BASE/uploads/complete" \
+            -H "Content-Type: application/json" \
+            -H "x-job-secret: $JOB_SECRET" \
+            -d "{\"assetId\":\"$ASSET_ID\"}"
+
+          curl -X POST "$API_BASE/jobs/mindar/complete" \
+            -H "Content-Type: application/json" \
+            -H "x-job-secret: $JOB_SECRET" \
+            -d "{\"pairId\":\"${{ inputs.pairId }}\",\"mindAssetId\":\"$ASSET_ID\"}"
