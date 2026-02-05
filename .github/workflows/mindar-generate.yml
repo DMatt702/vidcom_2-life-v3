@@ -42,6 +42,12 @@ jobs:
       - name: Install Puppeteer
         run: npm install puppeteer
 
+      - name: Install Esbuild
+        run: npm install esbuild
+
+      - name: Bundle MindAR
+        run: npx esbuild scripts/vendor/mindar-image.prod.js --bundle --format=iife --outfile=/tmp/mindar-bundle.js
+
       - name: Validate inputs
         env:
           PAIR_ID: ${{ inputs.pairId }}
@@ -62,4 +68,5 @@ jobs:
           API_BASE: ${{ inputs.apiBase }}
           MINDAR_JOB_SECRET: ${{ secrets.MINDAR_JOB_SECRET }}
           JOB_TOKEN: ${{ inputs.jobToken }}
+          MINDAR_BUNDLE_PATH: /tmp/mindar-bundle.js
         run: node scripts/mindar-generate.mjs

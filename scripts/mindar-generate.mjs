@@ -1,4 +1,5 @@
 import puppeteer from "puppeteer";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 
@@ -82,10 +83,16 @@ async function compileMindTarget(dataUrl) {
       </html>`,
       { waitUntil: "load" }
     );
-    await page.addScriptTag({
-      type: "module",
-      content: `import * as mindar from "${mindarFileUrl}"; window.MINDAR = mindar;`
-    });
+    const bundlePath = process.env.MINDAR_BUNDLE_PATH || "";
+    if (bundlePath && fs.existsSync(bundlePath)) {
+      const bundleCode = fs.readFileSync(bundlePath, "utf8");
+      await page.addScriptTag({ content: bundleCode });
+    } else {
+      await page.addScriptTag({
+        type: "module",
+        content: `import * as mindar from "${mindarFileUrl}"; window.MINDAR = mindar;`
+      });
+    }
     await page.waitForFunction(() => {
       // @ts-ignore
       return Boolean(
