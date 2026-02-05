@@ -55,10 +55,17 @@ async function compileMindTarget(dataUrl) {
   });
   try {
     const page = await browser.newPage();
-    await page.goto("about:blank");
-    await page.addScriptTag({
-      url: "https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js"
-    });
+    await page.setContent(
+      `<!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <script src="https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js"></script>
+        </head>
+        <body></body>
+      </html>`,
+      { waitUntil: "load" }
+    );
     await page.waitForFunction(() => {
       // @ts-ignore
       return Boolean(
