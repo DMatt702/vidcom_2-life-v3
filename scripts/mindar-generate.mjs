@@ -1,6 +1,6 @@
 import puppeteer from "puppeteer";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const pairId = process.env.PAIR_ID || process.argv[2];
 const imagePublicUrl = process.env.IMAGE_PUBLIC_URL || process.argv[3];
@@ -66,6 +66,7 @@ async function compileMindTarget(dataUrl) {
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const mindarPath = path.resolve(__dirname, "vendor", "mindar-image.prod.js");
+    const mindarFileUrl = pathToFileURL(mindarPath).href;
     await page.setContent(
       `<!doctype html>
       <html>
@@ -76,12 +77,18 @@ async function compileMindTarget(dataUrl) {
       </html>`,
       { waitUntil: "load" }
     );
-    await page.addScriptTag({ path: mindarPath });
+    await page.addScriptTag({
+      type: "module",
+      content: `import * as mindar from "${mindarFileUrl}"; window.MINDAR = mindar;`
+    });
     await page.waitForFunction(() => {
       // @ts-ignore
       return Boolean(
         // @ts-ignore
-        window.MINDAR && (window.MINDAR.Compiler || (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler))
+        window.MINDAR &&
+          (window.MINDAR.Compiler ||
+            (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler) ||
+            (window.MINDAR.MINDAR && window.MINDAR.MINDAR.Compiler))
       );
     }, { timeout: 30000 });
     const base64 = await page.evaluate(async (imageDataUrl) => {
@@ -89,7 +96,13 @@ async function compileMindTarget(dataUrl) {
       img.src = imageDataUrl;
       await img.decode();
       // @ts-ignore
-      const CompilerCtor = window.MINDAR.Compiler || (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler);
+      const CompilerCtor =
+        // @ts-ignore
+        window.MINDAR.Compiler ||
+        // @ts-ignore
+        (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler) ||
+        // @ts-ignore
+        (window.MINDAR.MINDAR && window.MINDAR.MINDAR.Compiler);
       if (!CompilerCtor) {
         throw new Error("MindAR Compiler not found on window");
       }
