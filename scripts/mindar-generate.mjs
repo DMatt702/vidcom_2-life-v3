@@ -61,14 +61,21 @@ async function compileMindTarget(dataUrl) {
     });
     await page.waitForFunction(() => {
       // @ts-ignore
-      return Boolean(window.MINDAR && window.MINDAR.Compiler);
-    }, { timeout: 10000 });
+      return Boolean(
+        // @ts-ignore
+        window.MINDAR && (window.MINDAR.Compiler || (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler))
+      );
+    }, { timeout: 30000 });
     const base64 = await page.evaluate(async (imageDataUrl) => {
       const img = new Image();
       img.src = imageDataUrl;
       await img.decode();
       // @ts-ignore
-      const compiler = new window.MINDAR.Compiler();
+      const CompilerCtor = window.MINDAR.Compiler || (window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler);
+      if (!CompilerCtor) {
+        throw new Error("MindAR Compiler not found on window");
+      }
+      const compiler = new CompilerCtor();
       await compiler.compileImageTargets([img], () => {});
       const buffer = await compiler.exportData();
       const bytes = new Uint8Array(buffer);
