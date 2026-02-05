@@ -53,7 +53,12 @@ async function downloadImageDataUrl(url) {
 
 async function compileMindTarget(dataUrl) {
   const browser = await puppeteer.launch({
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--allow-file-access-from-files",
+      "--disable-web-security"
+    ]
   });
   try {
     const page = await browser.newPage();
