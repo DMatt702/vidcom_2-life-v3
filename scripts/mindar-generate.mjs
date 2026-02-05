@@ -1,4 +1,6 @@
 import puppeteer from "puppeteer";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const pairId = process.env.PAIR_ID || process.argv[2];
 const imagePublicUrl = process.env.IMAGE_PUBLIC_URL || process.argv[3];
@@ -55,17 +57,20 @@ async function compileMindTarget(dataUrl) {
   });
   try {
     const page = await browser.newPage();
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const mindarPath = path.resolve(__dirname, "vendor", "mindar-image.prod.js");
     await page.setContent(
       `<!doctype html>
       <html>
         <head>
           <meta charset="utf-8" />
-          <script src="https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js"></script>
         </head>
         <body></body>
       </html>`,
       { waitUntil: "load" }
     );
+    await page.addScriptTag({ path: mindarPath });
     await page.waitForFunction(() => {
       // @ts-ignore
       return Boolean(
