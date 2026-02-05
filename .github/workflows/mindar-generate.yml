@@ -30,8 +30,25 @@ jobs:
         with:
           node-version: 20
 
+      - name: Install Chromium deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 libgtk-3-0
+
       - name: Install Puppeteer
         run: npm install puppeteer
+
+      - name: Validate inputs
+        env:
+          PAIR_ID: ${{ inputs.pairId }}
+          IMAGE_PUBLIC_URL: ${{ inputs.imagePublicUrl }}
+          API_BASE: ${{ inputs.apiBase }}
+          MINDAR_JOB_SECRET: ${{ secrets.MINDAR_JOB_SECRET }}
+        run: |
+          if [ -z "$PAIR_ID" ]; then echo "PAIR_ID missing"; exit 1; fi
+          if [ -z "$IMAGE_PUBLIC_URL" ]; then echo "IMAGE_PUBLIC_URL missing"; exit 1; fi
+          if [ -z "$API_BASE" ]; then echo "API_BASE missing"; exit 1; fi
+          if [ -z "$MINDAR_JOB_SECRET" ]; then echo "MINDAR_JOB_SECRET missing"; exit 1; fi
 
       - name: Generate MindAR target
         env:
