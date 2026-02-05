@@ -1,4 +1,4 @@
-﻿export interface Env {
+export interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
   NODE_ENV?: string;
@@ -150,6 +150,10 @@ function genQrId() {
   return uuid().replace(/-/g, "").slice(0, 12);
 }
 
+function genJobToken() {
+  return uuid().replace(/-/g, "");
+}
+
 function sanitizeFilename(name: string) {
   const trimmed = name.trim();
   if (!trimmed) return "file";
@@ -202,7 +206,13 @@ function isJobSecretValid(env: Env, request: Request) {
   return secret.length > 0 && header === secret;
 }
 
-async function dispatchMindarJob(env: Env, pairId: string, imagePublicUrl: string, apiBase: string) {
+async function dispatchMindarJob(
+  env: Env,
+  pairId: string,
+  imagePublicUrl: string,
+  apiBase: string,
+  jobToken: string
+) {
   if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
     console.log("MindAR job dispatch skipped: missing GITHUB_TOKEN or GITHUB_REPO");
     return { ok: false, error: "Missing GITHUB_TOKEN or GITHUB_REPO" };
@@ -214,6 +224,7 @@ async function dispatchMindarJob(env: Env, pairId: string, imagePublicUrl: strin
       pairId,
       imagePublicUrl,
       apiBase,
+      jobToken,
     },
   };
   const resp = await fetch(url, {
@@ -240,12 +251,13 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
       const origin = url.origin;
+      const publicPath = path.startsWith("/api/") ? path.slice(4) : path;
 
       if (request.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders(request) });
       }
 
-      if (path === "/api/health") {
+      if (publicPath === "/health") {
         return json(request, {
           ok: true,
           service: "vidcom-api",
@@ -256,8 +268,8 @@ export default {
       }
 
       // ---- PUBLIC ASSETS ----
-      if (path.startsWith("/public/assets/") && request.method === "GET") {
-        const assetId = decodeURIComponent(path.slice("/public/assets/".length));
+      if (publicPath.startsWith("/public/assets/") && request.method === "GET") {
+        const assetId = decodeURIComponent(publicPath.slice("/public/assets/".length));
         if (!assetId) return json(request, { error: "Not Found", build: BUILD }, 404);
         const asset = await env.DB.prepare(
           "SELECT id, r2_key, mime FROM assets WHERE id = ? LIMIT 1"
@@ -274,7 +286,7 @@ export default {
       }
 
       // ---- PUBLIC ----
-      const publicMatch = path.match(/^\/public\/experience\/([^/]+)$/);
+      const publicMatch = publicPath.match(/^\/public\/experience\/([^/]+)$/);
       if (publicMatch && request.method === "GET") {
         const qrId = decodeURIComponent(publicMatch[1]);
         const exp = await env.DB.prepare(
@@ -454,12 +466,13 @@ export default {
         if (!pairId || !imageAssetId) {
           return json(request, { error: "Missing pairId or image_asset_id", build: BUILD }, 400);
         }
+        const jobToken = genJobToken();
         const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
         const t = nowIso();
         await env.DB.prepare(
-          "UPDATE pairs SET mind_target_status = ?, mind_target_error = NULL, mind_target_requested_at = ? WHERE id = ?"
-        ).bind("pending", t, pairId).run();
-        const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+          "UPDATE pairs SET mind_target_status = ?, mind_target_error = NULL, mind_target_requested_at = ?, mind_target_job_token = ? WHERE id = ?"
+        ).bind("pending", t, jobToken, pairId).run();
+        const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin, jobToken);
         if (!result.ok) {
           await env.DB.prepare(
             "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
@@ -468,8 +481,92 @@ export default {
         return json(request, { ok: result.ok, error: result.error || null, build: BUILD }, 200);
       }
 
+      if (path === "/jobs/mindar/runs" && request.method === "GET") {
+        if (!user) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
+          return json(request, { error: "Missing GITHUB_TOKEN or GITHUB_REPO", build: BUILD }, 400);
+        }
+        const runsUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/mindar-generate.yml/runs?per_page=5`;
+        const resp = await fetch(runsUrl, {
+          headers: {
+            Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+            "User-Agent": "vidcom-mindar-dispatch",
+            Accept: "application/vnd.github+json",
+          },
+        });
+        const text = await resp.text();
+        if (!resp.ok) {
+          return json(request, { error: `GitHub runs fetch failed (${resp.status})`, detail: text, build: BUILD }, 400);
+        }
+        try {
+          const data = JSON.parse(text);
+          return json(request, { ok: true, data, build: BUILD }, 200);
+        } catch {
+          return json(request, { ok: true, raw: text, build: BUILD }, 200);
+        }
+      }
+
+      const runMatch = path.match(/^\/jobs\/mindar\/run\/([^/]+)$/);
+      if (runMatch && request.method === "GET") {
+        if (!user) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
+          return json(request, { error: "Missing GITHUB_TOKEN or GITHUB_REPO", build: BUILD }, 400);
+        }
+        const runId = decodeURIComponent(runMatch[1]);
+        const jobsUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/runs/${runId}/jobs`;
+        const resp = await fetch(jobsUrl, {
+          headers: {
+            Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+            "User-Agent": "vidcom-mindar-dispatch",
+            Accept: "application/vnd.github+json",
+          },
+        });
+        const text = await resp.text();
+        if (!resp.ok) {
+          return json(request, { error: `GitHub jobs fetch failed (${resp.status})`, detail: text, build: BUILD }, 400);
+        }
+        try {
+          const data = JSON.parse(text);
+          return json(request, { ok: true, data, build: BUILD }, 200);
+        } catch {
+          return json(request, { ok: true, raw: text, build: BUILD }, 200);
+        }
+      }
+
+      const logMatch = path.match(/^\/jobs\/mindar\/logs\/([^/]+)$/);
+      if (logMatch && request.method === "GET") {
+        if (!user) {
+          return json(request, { error: "Unauthorized", build: BUILD }, 401);
+        }
+        if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
+          return json(request, { error: "Missing GITHUB_TOKEN or GITHUB_REPO", build: BUILD }, 400);
+        }
+        const runId = decodeURIComponent(logMatch[1]);
+        const logsUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/runs/${runId}/logs`;
+        const resp = await fetch(logsUrl, {
+          headers: {
+            Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+            "User-Agent": "vidcom-mindar-dispatch",
+            Accept: "application/vnd.github+json",
+          },
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          return json(request, { error: `GitHub logs fetch failed (${resp.status})`, detail: text, build: BUILD }, 400);
+        }
+        const buf = await resp.arrayBuffer();
+        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+        return json(request, { ok: true, runId, zipBase64: b64, build: BUILD }, 200);
+      }
+
       if (path === "/jobs/mindar/complete" && request.method === "POST") {
-        if (!isJobSecretValid(env, request)) {
+        const jobTokenHeader = request.headers.get("x-job-token") || "";
+        let jobTokenOk = false;
+        if (!isJobSecretValid(env, request) && !jobTokenHeader) {
           return json(request, { error: "Unauthorized", build: BUILD }, 401);
         }
         const body = await readBodyAny(request);
@@ -479,15 +576,24 @@ export default {
         if (!pairId) {
           return json(request, { error: "Missing pairId", build: BUILD }, 400);
         }
+        if (!isJobSecretValid(env, request) && jobTokenHeader) {
+          const tokenRow = await env.DB.prepare(
+            "SELECT mind_target_job_token FROM pairs WHERE id = ? LIMIT 1"
+          ).bind(pairId).first<{ mind_target_job_token: string | null }>();
+          jobTokenOk = Boolean(tokenRow?.mind_target_job_token && tokenRow.mind_target_job_token === jobTokenHeader);
+          if (!jobTokenOk) {
+            return json(request, { error: "Unauthorized", build: BUILD }, 401);
+          }
+        }
         const t = nowIso();
         if (errorMessage || !mindAssetId) {
           await env.DB.prepare(
-            "UPDATE pairs SET mind_target_status = ?, mind_target_error = ?, mind_target_completed_at = ? WHERE id = ?"
+            "UPDATE pairs SET mind_target_status = ?, mind_target_error = ?, mind_target_completed_at = ?, mind_target_job_token = NULL WHERE id = ?"
           ).bind("failed", errorMessage || "MindAR generation failed", t, pairId).run();
           return json(request, { ok: false, error: errorMessage || "MindAR generation failed", build: BUILD }, 200);
         }
         await env.DB.prepare(
-          "UPDATE pairs SET mind_target_asset_id = ?, mind_target_status = ?, mind_target_error = NULL, mind_target_completed_at = ? WHERE id = ?"
+          "UPDATE pairs SET mind_target_asset_id = ?, mind_target_status = ?, mind_target_error = NULL, mind_target_completed_at = ?, mind_target_job_token = NULL WHERE id = ?"
         ).bind(mindAssetId, "ready", t, pairId).run();
         return json(request, { ok: true, build: BUILD }, 200);
       }
@@ -653,8 +759,9 @@ export default {
         }
 
         const id = uuid();
+        const jobToken = genJobToken();
         await env.DB.prepare(
-          "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, mind_target_status, mind_target_requested_at, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)"
+          "INSERT INTO pairs (id, experience_id, image_asset_id, video_asset_id, mind_target_status, mind_target_requested_at, mind_target_job_token, image_fingerprint, threshold, priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)"
         ).bind(
           id,
           expId,
@@ -662,13 +769,14 @@ export default {
           videoAssetId,
           "pending",
           nowIso(),
+          jobToken,
           fingerprint ? JSON.stringify(fingerprint) : null,
           threshold,
           priority
         ).run();
 
         const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
-        const result = await dispatchMindarJob(env, id, imagePublicUrl, origin);
+        const result = await dispatchMindarJob(env, id, imagePublicUrl, origin, jobToken);
         if (!result.ok) {
           await env.DB.prepare(
             "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
@@ -728,7 +836,11 @@ export default {
 
         if (imageChanged) {
           const imagePublicUrl = `${origin}/public/assets/${imageAssetId}`;
-          const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin);
+          const jobToken = genJobToken();
+          await env.DB.prepare(
+            "UPDATE pairs SET mind_target_job_token = ? WHERE id = ?"
+          ).bind(jobToken, pairId).run();
+          const result = await dispatchMindarJob(env, pairId, imagePublicUrl, origin, jobToken);
           if (!result.ok) {
             await env.DB.prepare(
               "UPDATE pairs SET mind_target_status = ?, mind_target_error = ? WHERE id = ?"
