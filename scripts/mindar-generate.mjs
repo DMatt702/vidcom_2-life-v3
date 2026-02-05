@@ -57,6 +57,12 @@ async function compileMindTarget(dataUrl) {
   });
   try {
     const page = await browser.newPage();
+    page.on("pageerror", (err) => {
+      log(`pageerror: ${err.message}`);
+    });
+    page.on("console", (msg) => {
+      log(`console: ${msg.text()}`);
+    });
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const mindarPath = path.resolve(__dirname, "vendor", "mindar-image.prod.js");
