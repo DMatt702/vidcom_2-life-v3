@@ -4,6 +4,7 @@ const pairId = process.env.PAIR_ID || process.argv[2];
 const imagePublicUrl = process.env.IMAGE_PUBLIC_URL || process.argv[3];
 const apiBaseInput = process.env.API_BASE || process.argv[4] || "https://vidcom-api-staging.vidcomfilmworks.workers.dev";
 const jobSecret = process.env.MINDAR_JOB_SECRET || "";
+const jobToken = process.env.JOB_TOKEN || "";
 
 const apiBase = apiBaseInput.replace(/\/+$/, "");
 
@@ -26,7 +27,8 @@ async function postJobComplete(payload) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-job-secret": jobSecret
+      "x-job-secret": jobSecret,
+      "x-job-token": jobToken
     },
     body: JSON.stringify(payload)
   });
@@ -55,12 +57,17 @@ async function compileMindTarget(dataUrl) {
     const page = await browser.newPage();
     await page.goto("about:blank");
     await page.addScriptTag({
-      url: "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js"
+      url: "https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js"
     });
+    await page.waitForFunction(() => {
+      // @ts-ignore
+      return Boolean(window.MINDAR && window.MINDAR.Compiler);
+    }, { timeout: 10000 });
     const base64 = await page.evaluate(async (imageDataUrl) => {
       const img = new Image();
       img.src = imageDataUrl;
       await img.decode();
+      // @ts-ignore
       const compiler = new window.MINDAR.Compiler();
       await compiler.compileImageTargets([img], () => {});
       const buffer = await compiler.exportData();
@@ -140,8 +147,8 @@ async function main() {
   if (!pairId || !imagePublicUrl) {
     throw new Error("PAIR_ID and IMAGE_PUBLIC_URL are required.");
   }
-  if (!jobSecret) {
-    throw new Error("MINDAR_JOB_SECRET is required.");
+  if (!jobSecret && !jobToken) {
+    throw new Error("MINDAR_JOB_SECRET or JOB_TOKEN is required.");
   }
 
   log(`Downloading image: ${imagePublicUrl}`);
